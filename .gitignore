@@ -17,3 +17,5 @@ data/*
 
 # Test files
 test_slides.pdf
+.pdf
+.pptx

@@ -2,15 +2,15 @@
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import List
-import io
+from typing import List, Optional
 import subprocess
 import tempfile
 import shutil
 
 import fitz  # PyMuPDF
-from PIL import Image
 from PyQt5.QtGui import QPixmap, QImage
+
+from ..models.slide import Slide
 
 
 class SlideLoader(ABC):
@@ -22,8 +22,23 @@ class SlideLoader(ABC):
         pass
 
     @abstractmethod
-    def get_slide(self, index: int) -> QPixmap:
-        """Get slide at index as QPixmap."""
+    def get_slide(self, index: int) -> Slide:
+        """Get slide at index."""
+        pass
+
+    @abstractmethod
+    def get_slide_image(self, index: int) -> QPixmap:
+        """Get slide image at index as QPixmap."""
+        pass
+
+    @abstractmethod
+    def get_slide_text(self, index: int) -> str:
+        """Get text content of slide at index."""
+        pass
+
+    @abstractmethod
+    def get_all_slides(self) -> List[Slide]:
+        """Get all slides."""
         pass
 
     @abstractmethod
@@ -31,20 +46,43 @@ class SlideLoader(ABC):
         """Return total number of slides."""
         pass
 
+    def close(self):
+        """Clean up resources."""
+        pass
+
 
 class PDFLoader(SlideLoader):
     """Loader for PDF files using PyMuPDF."""
 
     def __init__(self):
-        self.doc = None
+        self.doc: Optional[fitz.Document] = None
         self._slide_count = 0
+        self._slides: List[Slide] = []
 
     def load(self, file_path: str) -> int:
         self.doc = fitz.open(file_path)
         self._slide_count = len(self.doc)
+
+        # Pre-extract text for all slides
+        self._slides = []
+        for i in range(self._slide_count):
+            page = self.doc[i]
+            text = page.get_text()
+            self._slides.append(Slide(index=i, text=text))
+
         return self._slide_count
 
-    def get_slide(self, index: int) -> QPixmap:
+    def get_slide(self, index: int) -> Slide:
+        if index < 0 or index >= self._slide_count:
+            return Slide(index=index, text="")
+
+        slide = self._slides[index]
+        # Lazy load image if not already loaded
+        if slide.image is None:
+            slide.image = self.get_slide_image(index)
+        return slide
+
+    def get_slide_image(self, index: int) -> QPixmap:
         if self.doc is None or index < 0 or index >= self._slide_count:
             return QPixmap()
 
@@ -56,6 +94,14 @@ class PDFLoader(SlideLoader):
         # Convert to QPixmap
         img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
         return QPixmap.fromImage(img)
+
+    def get_slide_text(self, index: int) -> str:
+        if index < 0 or index >= self._slide_count:
+            return ""
+        return self._slides[index].text
+
+    def get_all_slides(self) -> List[Slide]:
+        return self._slides
 
     def slide_count(self) -> int:
         return self._slide_count
@@ -69,8 +115,8 @@ class PPTXLoader(SlideLoader):
     """Loader for PowerPoint files by converting to PDF via LibreOffice."""
 
     def __init__(self):
-        self._pdf_loader = None
-        self._temp_dir = None
+        self._pdf_loader: Optional[PDFLoader] = None
+        self._temp_dir: Optional[str] = None
         self._slide_count = 0
 
     def load(self, file_path: str) -> int:
@@ -111,9 +157,8 @@ class PPTXLoader(SlideLoader):
         self._slide_count = self._pdf_loader.load(str(pdf_path))
         return self._slide_count
 
-    def _find_libreoffice(self) -> str:
+    def _find_libreoffice(self) -> Optional[str]:
         """Find LibreOffice executable."""
-        # Common locations on different platforms
         candidates = [
             "/Applications/LibreOffice.app/Contents/MacOS/soffice",  # macOS
             "/usr/bin/soffice",  # Linux
@@ -130,10 +175,25 @@ class PPTXLoader(SlideLoader):
 
         return None
 
-    def get_slide(self, index: int) -> QPixmap:
+    def get_slide(self, index: int) -> Slide:
+        if self._pdf_loader is None:
+            return Slide(index=index, text="")
+        return self._pdf_loader.get_slide(index)
+
+    def get_slide_image(self, index: int) -> QPixmap:
         if self._pdf_loader is None:
             return QPixmap()
-        return self._pdf_loader.get_slide(index)
+        return self._pdf_loader.get_slide_image(index)
+
+    def get_slide_text(self, index: int) -> str:
+        if self._pdf_loader is None:
+            return ""
+        return self._pdf_loader.get_slide_text(index)
+
+    def get_all_slides(self) -> List[Slide]:
+        if self._pdf_loader is None:
+            return []
+        return self._pdf_loader.get_all_slides()
 
     def slide_count(self) -> int:
         return self._slide_count

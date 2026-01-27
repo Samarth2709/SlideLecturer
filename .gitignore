@@ -1,0 +1,19 @@
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime data
+data/*
+!data/.gitkeep
+
+# OS
+.DS_Store
+
+# Test files
+test_slides.pdf

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""SlideLecturer - A slide viewer for PDF and PowerPoint files."""
+"""SlideLecturer - AI-powered slide viewer for PDF and PowerPoint files."""
 
 import sys
 from pathlib import Path
 
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
-from loader import get_loader
-from viewer import SlideViewer
+from src.services.slide_loader import get_loader
+from src.services.ai_service import AIService
+from src.ui.main_window import MainWindow
+from src.utils.config import get_api_key
 
 
 def main():
@@ -38,11 +40,25 @@ def main():
     app.setApplicationName("SlideLecturer")
 
     try:
+        # Get loader for file type
         loader = get_loader(file_path)
-        viewer = SlideViewer(loader, str(path.absolute()))
-        viewer.setWindowTitle(f"SlideLecturer - {path.name}")
-        viewer.show()
+
+        # Initialize AI service
+        api_key = get_api_key()
+        ai_service = None
+        if api_key:
+            ai_service = AIService(api_key)
+        else:
+            print("Warning: ANTHROPIC_API_KEY not set. AI features will be disabled.")
+            print("Set it via environment variable or create a .env file.")
+
+        # Create and show main window
+        window = MainWindow(loader, str(path.absolute()), ai_service)
+        window.setWindowTitle(f"SlideLecturer - {path.name}")
+        window.show()
+
         sys.exit(app.exec_())
+
     except Exception as e:
         QMessageBox.critical(None, "Error", f"Failed to open file:\n{str(e)}")
         sys.exit(1)

@@ -10,6 +10,7 @@ from src.services.slide_loader import get_loader
 from src.services.ai_service import AIService
 from src.ui.main_window import MainWindow
 from src.utils.config import get_api_key
+from src.utils.theme import Theme
 
 
 def main():
@@ -38,6 +39,7 @@ def main():
     # Create Qt application
     app = QApplication(sys.argv)
     app.setApplicationName("SlideLecturer")
+    app.setStyleSheet(Theme.get_app_stylesheet())
 
     try:
         # Get loader for file type

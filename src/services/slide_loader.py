@@ -46,6 +46,11 @@ class SlideLoader(ABC):
         """Return total number of slides."""
         pass
 
+    @abstractmethod
+    def get_pdf_path(self) -> Optional[str]:
+        """Get the path to the PDF file (for AI context)."""
+        pass
+
     def close(self):
         """Clean up resources."""
         pass
@@ -58,8 +63,10 @@ class PDFLoader(SlideLoader):
         self.doc: Optional[fitz.Document] = None
         self._slide_count = 0
         self._slides: List[Slide] = []
+        self._pdf_path: Optional[str] = None
 
     def load(self, file_path: str) -> int:
+        self._pdf_path = file_path
         self.doc = fitz.open(file_path)
         self._slide_count = len(self.doc)
 
@@ -106,6 +113,9 @@ class PDFLoader(SlideLoader):
     def slide_count(self) -> int:
         return self._slide_count
 
+    def get_pdf_path(self) -> Optional[str]:
+        return self._pdf_path
+
     def close(self):
         if self.doc:
             self.doc.close()
@@ -118,6 +128,7 @@ class PPTXLoader(SlideLoader):
         self._pdf_loader: Optional[PDFLoader] = None
         self._temp_dir: Optional[str] = None
         self._slide_count = 0
+        self._pdf_path: Optional[str] = None
 
     def load(self, file_path: str) -> int:
         # Find LibreOffice
@@ -152,9 +163,12 @@ class PPTXLoader(SlideLoader):
         if not pdf_path.exists():
             raise RuntimeError("Conversion failed: PDF file not created")
 
+        # Store the PDF path for AI context
+        self._pdf_path = str(pdf_path)
+
         # Use PDF loader to load the converted file
         self._pdf_loader = PDFLoader()
-        self._slide_count = self._pdf_loader.load(str(pdf_path))
+        self._slide_count = self._pdf_loader.load(self._pdf_path)
         return self._slide_count
 
     def _find_libreoffice(self) -> Optional[str]:
@@ -197,6 +211,9 @@ class PPTXLoader(SlideLoader):
 
     def slide_count(self) -> int:
         return self._slide_count
+
+    def get_pdf_path(self) -> Optional[str]:
+        return self._pdf_path
 
     def close(self):
         if self._pdf_loader:

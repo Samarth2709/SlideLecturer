@@ -1,17 +1,20 @@
 """Chat sidebar for AI interaction."""
 
+import base64
 from typing import List, Optional
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTextEdit, QLineEdit, QPushButton, QScrollArea,
-    QFrame, QSizePolicy
+    QFrame, QSizePolicy, QTextBrowser
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QThread, pyqtSlot
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, pyqtSlot, QBuffer, QIODevice
+from PyQt5.QtGui import QFont, QPixmap
 
 from ..models.message import ChatMessage, MessageRole
 from ..models.slide import Slide
 from ..services.ai_service import AIService
+from ..utils.theme import Theme
+from ..utils.markdown_renderer import render_markdown
 
 
 class StreamWorker(QThread):
@@ -21,19 +24,25 @@ class StreamWorker(QThread):
     finished_streaming = pyqtSignal()
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, ai_service: AIService, question: str, current_slide: Slide, all_slides: List[Slide]):
+    def __init__(
+        self,
+        ai_service: AIService,
+        question: str,
+        current_slide: Optional[Slide],
+        focused_image_base64: Optional[str] = None
+    ):
         super().__init__()
         self.ai_service = ai_service
         self.question = question
         self.current_slide = current_slide
-        self.all_slides = all_slides
+        self.focused_image_base64 = focused_image_base64
 
     def run(self):
         try:
             for chunk in self.ai_service.ask_streaming(
                 self.question,
                 self.current_slide,
-                self.all_slides
+                self.focused_image_base64
             ):
                 self.chunk_received.emit(chunk)
             self.finished_streaming.emit()
@@ -47,55 +56,77 @@ class MessageBubble(QFrame):
     def __init__(self, message: ChatMessage, parent=None):
         super().__init__(parent)
         self.message = message
+        self._content_widget = None
         self._setup_ui()
 
     def _setup_ui(self):
         """Set up the message bubble UI."""
+        is_user = self.message.is_user
+        bg_color = Theme.USER_BG if is_user else Theme.AI_BG
+        text_color = Theme.USER_TEXT if is_user else Theme.AI_TEXT
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(4)
 
-        # Role label
-        role_label = QLabel("You" if self.message.is_user else "AI")
-        role_label.setStyleSheet(
-            "font-weight: bold; font-size: 12px; color: #666;"
-        )
+        # Role label - styled to match bubble background
+        role_label = QLabel("You" if is_user else "AI")
+        role_label.setStyleSheet(f"""
+            QLabel {{
+                font-weight: bold;
+                font-size: 13px;
+                color: {Theme.TEXT_SECONDARY};
+                background-color: transparent;
+                padding: 0;
+                margin: 0;
+            }}
+        """)
         layout.addWidget(role_label)
 
-        # Message content
-        content_label = QLabel(self.message.content)
+        # Message content - QLabel for both (simpler, cleaner)
+        content_label = QLabel(self.message.content if is_user else "")
         content_label.setWordWrap(True)
-        content_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        content_label.setStyleSheet("font-size: 14px;")
+        content_label.setTextFormat(Qt.RichText if not is_user else Qt.PlainText)
+        content_label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+        content_label.setOpenExternalLinks(True)
+        content_label.setStyleSheet(f"""
+            QLabel {{
+                font-size: 16px;
+                color: {text_color};
+                background-color: transparent;
+                padding: 0;
+                margin: 0;
+                line-height: 1.4;
+            }}
+        """)
+
+        # Set content for AI messages with markdown
+        if not is_user and self.message.content:
+            html = render_markdown(self.message.content)
+            content_label.setText(html)
+
+        self._content_widget = content_label
         layout.addWidget(content_label)
 
-        # Style based on role
-        if self.message.is_user:
-            self.setStyleSheet("""
-                MessageBubble {
-                    background-color: #e3f2fd;
-                    border-radius: 8px;
-                    margin-left: 20px;
-                }
-            """)
-        else:
-            self.setStyleSheet("""
-                MessageBubble {
-                    background-color: #f5f5f5;
-                    border-radius: 8px;
-                    margin-right: 20px;
-                }
-            """)
+        # Style the bubble frame
+        margin = "margin-left: 30px;" if is_user else "margin-right: 30px;"
+        self.setStyleSheet(f"""
+            MessageBubble {{
+                background-color: {bg_color};
+                border-radius: {Theme.RADIUS_LG};
+                {margin}
+            }}
+        """)
 
     def update_content(self, content: str):
         """Update the message content (for streaming)."""
         self.message.content = content
-        # Find and update the content label
-        for i in range(self.layout().count()):
-            widget = self.layout().itemAt(i).widget()
-            if isinstance(widget, QLabel) and widget.text() != "You" and widget.text() != "AI":
-                widget.setText(content)
-                break
+
+        if self.message.is_user:
+            self._content_widget.setText(content)
+        else:
+            html = render_markdown(content)
+            self._content_widget.setText(html)
 
 
 class ChatSidebar(QWidget):
@@ -108,9 +139,12 @@ class ChatSidebar(QWidget):
         self.ai_service = ai_service
         self._messages: List[ChatMessage] = []
         self._current_slide: Optional[Slide] = None
-        self._all_slides: List[Slide] = []
         self._streaming_bubble: Optional[MessageBubble] = None
         self._worker: Optional[StreamWorker] = None
+        # Focused slide state
+        self._focused_slide_index: Optional[int] = None
+        self._focused_slide_pixmap: Optional[QPixmap] = None
+        self._focused_slide: Optional[Slide] = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -121,17 +155,13 @@ class ChatSidebar(QWidget):
 
         # Header
         header = QFrame()
-        header.setStyleSheet("""
-            QFrame {
-                background-color: #f8f9fa;
-                border-bottom: 1px solid #dee2e6;
-            }
-        """)
+        header.setStyleSheet(Theme.get_chat_header_style())
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(15, 12, 15, 12)
 
         title = QLabel("Ask AI")
         title.setFont(QFont("", 14, QFont.Bold))
+        title.setStyleSheet(f"color: {Theme.TEXT_PRIMARY};")
         header_layout.addWidget(title)
         header_layout.addStretch()
 
@@ -141,12 +171,7 @@ class ChatSidebar(QWidget):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setStyleSheet("""
-            QScrollArea {
-                border: none;
-                background-color: white;
-            }
-        """)
+        scroll_area.setStyleSheet(Theme.get_messages_area_style())
 
         self.messages_container = QWidget()
         self.messages_layout = QVBoxLayout(self.messages_container)
@@ -163,53 +188,50 @@ class ChatSidebar(QWidget):
 
         # Input area
         input_frame = QFrame()
-        input_frame.setStyleSheet("""
-            QFrame {
-                background-color: #f8f9fa;
-                border-top: 1px solid #dee2e6;
-            }
-        """)
+        input_frame.setStyleSheet(Theme.get_chat_input_frame_style())
         input_layout = QHBoxLayout(input_frame)
-        input_layout.setContentsMargins(10, 10, 10, 10)
-        input_layout.setSpacing(8)
+        input_layout.setContentsMargins(12, 12, 12, 12)
+        input_layout.setSpacing(10)
 
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Ask a question about this slide...")
-        self.input_field.setStyleSheet("""
-            QLineEdit {
-                padding: 10px;
-                border: 1px solid #dee2e6;
-                border-radius: 6px;
+        self.input_field.setPlaceholderText("Ask a question about the slides...")
+        self.input_field.setStyleSheet(f"""
+            QLineEdit {{
+                padding: 12px;
+                border: 2px solid {Theme.BORDER};
+                border-radius: {Theme.RADIUS_MD};
                 font-size: 14px;
-                background-color: white;
-            }
-            QLineEdit:focus {
-                border-color: #0078d4;
-            }
+                background-color: {Theme.SURFACE_ELEVATED};
+                color: {Theme.TEXT_PRIMARY};
+            }}
+            QLineEdit:focus {{
+                border-color: {Theme.PRIMARY};
+            }}
         """)
         self.input_field.returnPressed.connect(self._on_send)
         input_layout.addWidget(self.input_field)
 
         self.send_btn = QPushButton("Send")
-        self.send_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0078d4;
+        self.send_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {Theme.PRIMARY};
                 color: white;
                 border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
+                padding: 12px 24px;
+                border-radius: {Theme.RADIUS_MD};
                 font-size: 14px;
                 font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton:pressed {
-                background-color: #005a9e;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
+            }}
+            QPushButton:hover {{
+                background-color: {Theme.PRIMARY_HOVER};
+            }}
+            QPushButton:pressed {{
+                background-color: {Theme.PRIMARY_PRESSED};
+            }}
+            QPushButton:disabled {{
+                background-color: {Theme.BORDER};
+                color: {Theme.TEXT_MUTED};
+            }}
         """)
         self.send_btn.clicked.connect(self._on_send)
         input_layout.addWidget(self.send_btn)
@@ -247,19 +269,69 @@ class ChatSidebar(QWidget):
             self.scroll_area.verticalScrollBar().maximum()
         ))
 
-    def set_context(self, current_slide: Slide, all_slides: List[Slide]):
-        """Set the slide context for AI queries.
+    def set_context(self, current_slide: Slide):
+        """Set the current slide context.
 
         Args:
             current_slide: The currently viewed slide
-            all_slides: All slides in the deck
         """
         self._current_slide = current_slide
-        self._all_slides = all_slides
 
     def set_ai_service(self, ai_service: AIService):
         """Set the AI service."""
         self.ai_service = ai_service
+
+    def set_pdf(self, pdf_path: str) -> bool:
+        """Set the PDF for AI context.
+
+        Args:
+            pdf_path: Path to the PDF file
+
+        Returns:
+            True if PDF was loaded successfully
+        """
+        if self.ai_service:
+            return self.ai_service.set_pdf(pdf_path)
+        return False
+
+    def set_focused_slide(self, index: int, pixmap: QPixmap, slide: Slide):
+        """Set the focused slide for AI context.
+
+        Args:
+            index: The slide index
+            pixmap: The slide image
+            slide: The slide object
+        """
+        self._focused_slide_index = index
+        self._focused_slide_pixmap = pixmap
+        self._focused_slide = slide
+        # Update placeholder to indicate focus mode
+        self.input_field.setPlaceholderText(
+            f"Ask about Slide {index + 1} (image included)..."
+        )
+
+    def clear_focused_slide(self):
+        """Clear the focused slide state."""
+        self._focused_slide_index = None
+        self._focused_slide_pixmap = None
+        self._focused_slide = None
+        # Update placeholder to indicate general mode
+        self.input_field.setPlaceholderText(
+            "Ask a question about the slides..."
+        )
+
+    def has_focused_slide(self) -> bool:
+        """Check if there's a focused slide."""
+        return self._focused_slide_index is not None
+
+    @staticmethod
+    def _pixmap_to_base64(pixmap: QPixmap) -> str:
+        """Convert a QPixmap to base64-encoded PNG string."""
+        buffer = QBuffer()
+        buffer.open(QIODevice.WriteOnly)
+        pixmap.save(buffer, "PNG")
+        image_bytes = buffer.data().data()
+        return base64.b64encode(image_bytes).decode('utf-8')
 
     def _on_send(self):
         """Handle send button click."""
@@ -271,18 +343,22 @@ class ChatSidebar(QWidget):
             self._show_error("AI service not available. Please set your ANTHROPIC_API_KEY.")
             return
 
-        if self._current_slide is None:
-            self._show_error("No slide loaded.")
-            return
-
         # Clear input
         self.input_field.clear()
+
+        # Determine slide context based on focus state
+        if self.has_focused_slide():
+            context_slide = self._focused_slide
+            image_base64 = self._pixmap_to_base64(self._focused_slide_pixmap)
+        else:
+            context_slide = self._current_slide
+            image_base64 = None
 
         # Add user message
         user_message = ChatMessage(
             role=MessageRole.USER,
             content=question,
-            slide_index=self._current_slide.index
+            slide_index=context_slide.index if context_slide else None
         )
         self._messages.append(user_message)
         self._add_message_bubble(user_message)
@@ -294,7 +370,7 @@ class ChatSidebar(QWidget):
         ai_message = ChatMessage(
             role=MessageRole.ASSISTANT,
             content="",
-            slide_index=self._current_slide.index
+            slide_index=context_slide.index if context_slide else None
         )
         self._streaming_bubble = self._add_message_bubble(ai_message)
 
@@ -302,8 +378,8 @@ class ChatSidebar(QWidget):
         self._worker = StreamWorker(
             self.ai_service,
             question,
-            self._current_slide,
-            self._all_slides
+            context_slide,
+            image_base64
         )
         self._worker.chunk_received.connect(self._on_chunk_received)
         self._worker.finished_streaming.connect(self._on_streaming_finished)

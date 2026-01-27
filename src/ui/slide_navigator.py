@@ -3,27 +3,7 @@
 from PyQt5.QtWidgets import QWidget, QHBoxLayout, QPushButton, QLabel
 from PyQt5.QtCore import Qt, pyqtSignal
 
-
-BUTTON_STYLE = """
-    QPushButton {
-        background-color: #0078d4;
-        color: white;
-        border: none;
-        padding: 10px 20px;
-        border-radius: 4px;
-        font-size: 14px;
-    }
-    QPushButton:hover {
-        background-color: #106ebe;
-    }
-    QPushButton:pressed {
-        background-color: #005a9e;
-    }
-    QPushButton:disabled {
-        background-color: #cccccc;
-        color: #666666;
-    }
-"""
+from ..utils.theme import Theme
 
 
 class SlideNavigator(QWidget):
@@ -41,27 +21,36 @@ class SlideNavigator(QWidget):
 
     def _setup_ui(self):
         """Set up the UI."""
+        # Navigator container styling
+        self.setStyleSheet(f"""
+            SlideNavigator {{
+                background-color: {Theme.SURFACE};
+                border-radius: {Theme.RADIUS_MD};
+                padding: 8px;
+            }}
+        """)
+
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(20)
 
         # Previous button
         self.prev_btn = QPushButton("Previous")
         self.prev_btn.setFixedWidth(120)
-        self.prev_btn.setStyleSheet(BUTTON_STYLE)
+        self.prev_btn.setStyleSheet(Theme.get_navigator_button_style())
         self.prev_btn.clicked.connect(self._on_previous)
         layout.addWidget(self.prev_btn)
 
         # Slide counter
         self.counter_label = QLabel("Slide 0 of 0")
         self.counter_label.setAlignment(Qt.AlignCenter)
-        self.counter_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.counter_label.setStyleSheet(Theme.get_counter_label_style())
         layout.addWidget(self.counter_label, stretch=1)
 
         # Next button
         self.next_btn = QPushButton("Next")
         self.next_btn.setFixedWidth(120)
-        self.next_btn.setStyleSheet(BUTTON_STYLE)
+        self.next_btn.setStyleSheet(Theme.get_navigator_button_style())
         self.next_btn.clicked.connect(self._on_next)
         layout.addWidget(self.next_btn)
 

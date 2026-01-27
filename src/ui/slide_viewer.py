@@ -4,6 +4,8 @@ from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QSizePolicy
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QPixmap
 
+from ..utils.theme import Theme
+
 
 class SlideViewer(QWidget):
     """Widget for displaying a single slide."""
@@ -22,12 +24,7 @@ class SlideViewer(QWidget):
         self.slide_label = QLabel()
         self.slide_label.setAlignment(Qt.AlignCenter)
         self.slide_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.slide_label.setStyleSheet("""
-            QLabel {
-                background-color: #2d2d2d;
-                border-radius: 4px;
-            }
-        """)
+        self.slide_label.setStyleSheet(Theme.get_slide_viewer_style())
         layout.addWidget(self.slide_label)
 
     def set_slide(self, pixmap: QPixmap):
@@ -67,12 +64,4 @@ class SlideViewer(QWidget):
         """Show an error message in the viewer."""
         self._current_pixmap = None
         self.slide_label.setText(message)
-        self.slide_label.setStyleSheet("""
-            QLabel {
-                background-color: #2d2d2d;
-                color: #ff6b6b;
-                font-size: 16px;
-                padding: 20px;
-                border-radius: 4px;
-            }
-        """)
+        self.slide_label.setStyleSheet(Theme.get_slide_error_style())

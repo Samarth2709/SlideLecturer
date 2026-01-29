@@ -18,8 +18,6 @@ class SlideWidget(QFrame):
     # Signal emitted when this slide is clicked
     clicked = pyqtSignal(int)  # Emits slide index (0-based)
 
-    # Maximum width for slides (prevents them from getting too large)
-    MAX_WIDTH = 1000
     # Minimum width for slides
     MIN_WIDTH = 300
 
@@ -70,12 +68,13 @@ class SlideWidget(QFrame):
         """)
 
     def _apply_unfocused_style(self):
-        """Apply unfocused (no border) style to the image label."""
+        """Apply unfocused (transparent border) style to the image label."""
         self.image_label.setStyleSheet(f"""
             QLabel {{
                 background-color: {Theme.SURFACE};
                 border-radius: {Theme.RADIUS_LG};
                 padding: 4px;
+                border: 3px solid transparent;
             }}
         """)
 
@@ -108,29 +107,22 @@ class SlideWidget(QFrame):
         self._update_display()
 
     def _update_display(self):
-        """Scale and display the pixmap."""
+        """Scale and display the pixmap to fit container width."""
         if self._pixmap is None or self._pixmap.isNull():
             return
 
         # Scale to fit width while maintaining aspect ratio
-        available_width = self.width() - 8  # Account for padding
+        # Account for padding (4px) and border (3px) on each side = 14px total
+        available_width = self.width() - 14
         if available_width < self.MIN_WIDTH:
             available_width = self.MIN_WIDTH
-
-        # Cap at maximum width
-        if available_width > self.MAX_WIDTH:
-            available_width = self.MAX_WIDTH
-
-        # Don't scale larger than original pixmap width
-        if available_width > self._pixmap.width():
-            available_width = self._pixmap.width()
 
         scaled = self._pixmap.scaledToWidth(
             available_width,
             Qt.SmoothTransformation
         )
         self.image_label.setPixmap(scaled)
-        self.image_label.setFixedHeight(scaled.height() + 8)
+        self.image_label.setFixedHeight(scaled.height() + 14)  # Account for padding + border
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

@@ -1,17 +1,13 @@
 """Slide navigation controls."""
 
-from PyQt5.QtWidgets import QWidget, QHBoxLayout, QPushButton, QLabel
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtWidgets import QWidget, QHBoxLayout, QLabel
+from PyQt5.QtCore import Qt
 
 from ..utils.theme import Theme
 
 
 class SlideNavigator(QWidget):
-    """Navigation controls for slides."""
-
-    # Signals
-    previous_clicked = pyqtSignal()
-    next_clicked = pyqtSignal()
+    """Navigation controls for slides - displays slide counter only."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -34,35 +30,11 @@ class SlideNavigator(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(20)
 
-        # Previous button
-        self.prev_btn = QPushButton("Previous")
-        self.prev_btn.setFixedWidth(120)
-        self.prev_btn.setStyleSheet(Theme.get_navigator_button_style())
-        self.prev_btn.clicked.connect(self._on_previous)
-        layout.addWidget(self.prev_btn)
-
-        # Slide counter
+        # Slide counter (centered)
         self.counter_label = QLabel("Slide 0 of 0")
         self.counter_label.setAlignment(Qt.AlignCenter)
         self.counter_label.setStyleSheet(Theme.get_counter_label_style())
         layout.addWidget(self.counter_label, stretch=1)
-
-        # Next button
-        self.next_btn = QPushButton("Next")
-        self.next_btn.setFixedWidth(120)
-        self.next_btn.setStyleSheet(Theme.get_navigator_button_style())
-        self.next_btn.clicked.connect(self._on_next)
-        layout.addWidget(self.next_btn)
-
-        self._update_buttons()
-
-    def _on_previous(self):
-        """Handle previous button click."""
-        self.previous_clicked.emit()
-
-    def _on_next(self):
-        """Handle next button click."""
-        self.next_clicked.emit()
 
     def set_state(self, current_index: int, total_slides: int):
         """Update the navigator state.
@@ -74,7 +46,6 @@ class SlideNavigator(QWidget):
         self._current_index = current_index
         self._total_slides = total_slides
         self._update_display()
-        self._update_buttons()
 
     def _update_display(self):
         """Update the counter display."""
@@ -84,11 +55,6 @@ class SlideNavigator(QWidget):
             self.counter_label.setText(
                 f"Slide {self._current_index + 1} of {self._total_slides}"
             )
-
-    def _update_buttons(self):
-        """Update button enabled states."""
-        self.prev_btn.setEnabled(self._current_index > 0)
-        self.next_btn.setEnabled(self._current_index < self._total_slides - 1)
 
     @property
     def current_index(self) -> int:

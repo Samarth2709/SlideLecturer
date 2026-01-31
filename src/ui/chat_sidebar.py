@@ -7,14 +7,83 @@ from PyQt5.QtWidgets import (
     QTextEdit, QLineEdit, QPushButton, QScrollArea,
     QFrame, QSizePolicy, QTextBrowser
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QThread, pyqtSlot, QBuffer, QIODevice
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, pyqtSlot, QBuffer, QIODevice, QTimer
 from PyQt5.QtGui import QFont, QPixmap
 
 from ..models.message import ChatMessage, MessageRole
 from ..models.slide import Slide
 from ..services.ai_service import AIService
 from ..utils.theme import Theme
-from ..utils.markdown_renderer import render_markdown
+from ..utils.markdown_renderer import render_markdown, render_markdown_streaming
+
+
+class TypingIndicator(QFrame):
+    """Animated typing indicator showing '...' animation."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dot_count = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._animate)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Set up the typing indicator UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(4)
+
+        # Role label
+        role_label = QLabel("AI")
+        role_label.setStyleSheet(f"""
+            QLabel {{
+                font-weight: bold;
+                font-size: 13px;
+                color: {Theme.TEXT_SECONDARY};
+                background-color: transparent;
+                padding: 0;
+                margin: 0;
+            }}
+        """)
+        layout.addWidget(role_label)
+
+        # Dots label
+        self._dots_label = QLabel(".")
+        self._dots_label.setStyleSheet(f"""
+            QLabel {{
+                font-size: 24px;
+                color: {Theme.TEXT_SECONDARY};
+                background-color: transparent;
+                padding: 0;
+                margin: 0;
+                letter-spacing: 4px;
+            }}
+        """)
+        layout.addWidget(self._dots_label)
+
+        # Style the frame
+        self.setStyleSheet(f"""
+            TypingIndicator {{
+                background-color: {Theme.AI_BG};
+                border-radius: {Theme.RADIUS_LG};
+                margin-right: 30px;
+            }}
+        """)
+
+    def _animate(self):
+        """Animate the dots."""
+        self._dot_count = (self._dot_count % 3) + 1
+        self._dots_label.setText("." * self._dot_count)
+
+    def start(self):
+        """Start the animation."""
+        self._dot_count = 0
+        self._dots_label.setText(".")
+        self._timer.start(400)  # 400ms interval
+
+    def stop(self):
+        """Stop the animation."""
+        self._timer.stop()
 
 
 class StreamWorker(QThread):
@@ -96,7 +165,6 @@ class MessageBubble(QFrame):
                 background-color: transparent;
                 padding: 0;
                 margin: 0;
-                line-height: 1.4;
             }}
         """)
 
@@ -118,14 +186,35 @@ class MessageBubble(QFrame):
             }}
         """)
 
-    def update_content(self, content: str):
-        """Update the message content (for streaming)."""
+    def update_content(self, content: str, streaming: bool = True):
+        """Update the message content (for streaming).
+        
+        Args:
+            content: The message content
+            streaming: If True, uses streaming-safe markdown rendering
+                      that handles incomplete syntax gracefully
+        """
         self.message.content = content
 
         if self.message.is_user:
             self._content_widget.setText(content)
         else:
-            html = render_markdown(content)
+            # Use streaming-aware renderer during streaming to handle
+            # incomplete markdown syntax without producing broken HTML
+            if streaming:
+                html = render_markdown_streaming(content)
+            else:
+                html = render_markdown(content)
+            self._content_widget.setText(html)
+
+    def finalize_content(self):
+        """Finalize the message content after streaming is complete.
+        
+        Re-renders the content with the full markdown renderer for
+        proper formatting now that all content is received.
+        """
+        if not self.message.is_user and self.message.content:
+            html = render_markdown(self.message.content)
             self._content_widget.setText(html)
 
 
@@ -141,6 +230,7 @@ class ChatSidebar(QWidget):
         self._current_slide: Optional[Slide] = None
         self._streaming_bubble: Optional[MessageBubble] = None
         self._worker: Optional[StreamWorker] = None
+        self._typing_indicator: Optional[TypingIndicator] = None
         # Focused slide state
         self._focused_slide_index: Optional[int] = None
         self._focused_slide_pixmap: Optional[QPixmap] = None
@@ -366,13 +456,12 @@ class ChatSidebar(QWidget):
         # Disable input while processing
         self._set_input_enabled(False)
 
-        # Create streaming bubble for AI response
-        ai_message = ChatMessage(
-            role=MessageRole.ASSISTANT,
-            content="",
-            slide_index=context_slide.index if context_slide else None
-        )
-        self._streaming_bubble = self._add_message_bubble(ai_message)
+        # Show typing indicator
+        self._show_typing_indicator()
+
+        # Streaming bubble will be created when first chunk arrives
+        self._streaming_bubble = None
+        self._pending_ai_message_context = context_slide
 
         # Start streaming worker
         self._worker = StreamWorker(
@@ -388,18 +477,48 @@ class ChatSidebar(QWidget):
 
         self.message_sent.emit(question)
 
+    def _show_typing_indicator(self):
+        """Show the typing indicator."""
+        self._typing_indicator = TypingIndicator()
+        # Insert before the stretch
+        self.messages_layout.insertWidget(
+            self.messages_layout.count() - 1,
+            self._typing_indicator
+        )
+        self._typing_indicator.start()
+        self._scroll_to_bottom()
+
+    def _hide_typing_indicator(self):
+        """Hide and remove the typing indicator."""
+        if self._typing_indicator:
+            self._typing_indicator.stop()
+            self._typing_indicator.deleteLater()
+            self._typing_indicator = None
+
     @pyqtSlot(str)
     def _on_chunk_received(self, chunk: str):
         """Handle receiving a chunk of the streamed response."""
-        if self._streaming_bubble:
-            current_content = self._streaming_bubble.message.content
-            self._streaming_bubble.update_content(current_content + chunk)
-            self._scroll_to_bottom()
+        # On first chunk, hide typing indicator and create streaming bubble
+        if self._streaming_bubble is None:
+            self._hide_typing_indicator()
+            context_slide = self._pending_ai_message_context
+            ai_message = ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content="",
+                slide_index=context_slide.index if context_slide else None
+            )
+            self._streaming_bubble = self._add_message_bubble(ai_message)
+
+        current_content = self._streaming_bubble.message.content
+        self._streaming_bubble.update_content(current_content + chunk)
+        self._scroll_to_bottom()
 
     @pyqtSlot()
     def _on_streaming_finished(self):
         """Handle streaming completion."""
         if self._streaming_bubble:
+            # Re-render with full markdown now that streaming is complete
+            self._streaming_bubble.finalize_content()
             self._messages.append(self._streaming_bubble.message)
         self._streaming_bubble = None
         self._worker = None

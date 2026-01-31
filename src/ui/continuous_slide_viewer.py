@@ -28,7 +28,12 @@ class SlideWidget(QFrame):
         self._slide_index = slide_number - 1  # 0-based index
         self._pixmap: Optional[QPixmap] = None
         self._is_focused = False
+        self._zoom_level = 1.0
         self._setup_ui()
+
+    def set_zoom(self, zoom_level: float):
+        """Set the zoom level for this slide."""
+        self._zoom_level = zoom_level
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -107,7 +112,7 @@ class SlideWidget(QFrame):
         self._update_display()
 
     def _update_display(self):
-        """Scale and display the pixmap to fit container width."""
+        """Scale and display the pixmap to fit container width with zoom."""
         if self._pixmap is None or self._pixmap.isNull():
             return
 
@@ -117,8 +122,11 @@ class SlideWidget(QFrame):
         if available_width < self.MIN_WIDTH:
             available_width = self.MIN_WIDTH
 
+        # Apply zoom level
+        zoomed_width = int(available_width * self._zoom_level)
+
         scaled = self._pixmap.scaledToWidth(
-            available_width,
+            zoomed_width,
             Qt.SmoothTransformation
         )
         self.image_label.setPixmap(scaled)
@@ -136,6 +144,13 @@ class ContinuousSlideViewer(QWidget):
     current_slide_changed = pyqtSignal(int)  # Emits slide index (0-based)
     # Signal emitted when slide focus changes (index, is_focused, pixmap or None)
     slide_focus_changed = pyqtSignal(int, bool, object)
+    # Signal emitted when zoom level changes
+    zoom_changed = pyqtSignal(float)
+
+    # Zoom constraints
+    ZOOM_MIN = 0.5
+    ZOOM_MAX = 2.0
+    ZOOM_STEP = 0.1
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -143,10 +158,45 @@ class ContinuousSlideViewer(QWidget):
         self._slide_widgets: List[SlideWidget] = []
         self._current_index = 0
         self._focused_index: Optional[int] = None
+        self._zoom_level = 1.0
         self._scroll_timer = QTimer()
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.timeout.connect(self._update_current_slide)
         self._setup_ui()
+
+    @property
+    def zoom_level(self) -> float:
+        """Get the current zoom level."""
+        return self._zoom_level
+
+    def zoom_in(self):
+        """Increase zoom level by ZOOM_STEP."""
+        new_zoom = min(self._zoom_level + self.ZOOM_STEP, self.ZOOM_MAX)
+        if new_zoom != self._zoom_level:
+            self._zoom_level = new_zoom
+            self._apply_zoom()
+            self.zoom_changed.emit(self._zoom_level)
+
+    def zoom_out(self):
+        """Decrease zoom level by ZOOM_STEP."""
+        new_zoom = max(self._zoom_level - self.ZOOM_STEP, self.ZOOM_MIN)
+        if new_zoom != self._zoom_level:
+            self._zoom_level = new_zoom
+            self._apply_zoom()
+            self.zoom_changed.emit(self._zoom_level)
+
+    def reset_zoom(self):
+        """Reset zoom level to 1.0."""
+        if self._zoom_level != 1.0:
+            self._zoom_level = 1.0
+            self._apply_zoom()
+            self.zoom_changed.emit(self._zoom_level)
+
+    def _apply_zoom(self):
+        """Apply current zoom level to all slide widgets."""
+        for widget in self._slide_widgets:
+            widget.set_zoom(self._zoom_level)
+            widget._update_display()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)

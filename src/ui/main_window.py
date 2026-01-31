@@ -4,7 +4,7 @@ from typing import Optional, List
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QSplitter, QMessageBox, QPushButton, QFrame
+    QSplitter, QMessageBox, QPushButton, QFrame, QLabel
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QKeyEvent, QPixmap
@@ -101,12 +101,67 @@ class MainWindow(QMainWindow):
         """)
         toggle_layout.addWidget(self.toggle_btn)
         toggle_layout.addStretch()
+
+        # Zoom controls
+        zoom_btn_style = f"""
+            QPushButton {{
+                background-color: {Theme.SURFACE};
+                color: {Theme.TEXT_SECONDARY};
+                border: 1px solid {Theme.BORDER};
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {Theme.SURFACE_ELEVATED};
+                color: {Theme.TEXT_PRIMARY};
+                border-color: {Theme.PRIMARY};
+            }}
+        """
+
+        self.zoom_out_btn = QPushButton("-")
+        self.zoom_out_btn.setFixedSize(28, 28)
+        self.zoom_out_btn.setToolTip("Zoom out (Ctrl+-)")
+        self.zoom_out_btn.setCursor(Qt.PointingHandCursor)
+        self.zoom_out_btn.setStyleSheet(zoom_btn_style)
+        self.zoom_out_btn.clicked.connect(self._on_zoom_out)
+        toggle_layout.addWidget(self.zoom_out_btn)
+
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setFixedWidth(50)
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        self.zoom_label.setStyleSheet(f"""
+            QLabel {{
+                color: {Theme.TEXT_SECONDARY};
+                font-size: 12px;
+                font-weight: 600;
+            }}
+        """)
+        toggle_layout.addWidget(self.zoom_label)
+
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.setFixedSize(28, 28)
+        self.zoom_in_btn.setToolTip("Zoom in (Ctrl++)")
+        self.zoom_in_btn.setCursor(Qt.PointingHandCursor)
+        self.zoom_in_btn.setStyleSheet(zoom_btn_style)
+        self.zoom_in_btn.clicked.connect(self._on_zoom_in)
+        toggle_layout.addWidget(self.zoom_in_btn)
+
+        self.zoom_reset_btn = QPushButton("Reset")
+        self.zoom_reset_btn.setFixedSize(50, 28)
+        self.zoom_reset_btn.setToolTip("Reset zoom (Ctrl+0)")
+        self.zoom_reset_btn.setCursor(Qt.PointingHandCursor)
+        self.zoom_reset_btn.setStyleSheet(zoom_btn_style)
+        self.zoom_reset_btn.clicked.connect(self._on_zoom_reset)
+        toggle_layout.addWidget(self.zoom_reset_btn)
+
         slide_layout.addWidget(toggle_container)
 
         # Continuous slide viewer
         self.slide_viewer = ContinuousSlideViewer()
         self.slide_viewer.current_slide_changed.connect(self._on_slide_changed)
         self.slide_viewer.slide_focus_changed.connect(self._on_slide_focus_changed)
+        self.slide_viewer.zoom_changed.connect(self._on_zoom_changed)
         slide_layout.addWidget(self.slide_viewer, stretch=1)
 
         # Navigation controls (slide counter only)
@@ -181,6 +236,22 @@ class MainWindow(QMainWindow):
         """Handle splitter resize - refresh slide sizes."""
         self.slide_viewer.refresh_slide_sizes()
 
+    def _on_zoom_in(self):
+        """Handle zoom in button click."""
+        self.slide_viewer.zoom_in()
+
+    def _on_zoom_out(self):
+        """Handle zoom out button click."""
+        self.slide_viewer.zoom_out()
+
+    def _on_zoom_reset(self):
+        """Handle zoom reset button click."""
+        self.slide_viewer.reset_zoom()
+
+    def _on_zoom_changed(self, zoom_level: float):
+        """Handle zoom level change from viewer."""
+        self.zoom_label.setText(f"{int(zoom_level * 100)}%")
+
     def _toggle_slides(self):
         """Toggle visibility of the slide viewer."""
         if self._slides_visible:
@@ -220,17 +291,43 @@ class MainWindow(QMainWindow):
             self.slide_viewer.scroll_to_slide(self.current_index + 1)
 
     def keyPressEvent(self, event: QKeyEvent):
-        """Handle keyboard navigation."""
-        if event.key() in (Qt.Key_Right, Qt.Key_Space, Qt.Key_Return):
+        """Handle keyboard navigation and zoom."""
+        # Don't handle keys when typing in chat input
+        if self.chat_sidebar.input_field.hasFocus():
+            super().keyPressEvent(event)
+            return
+
+        modifiers = event.modifiers()
+        key = event.key()
+
+        # Zoom controls: Ctrl+Plus / Ctrl+Minus / Ctrl+0
+        if modifiers & Qt.ControlModifier:
+            if key in (Qt.Key_Plus, Qt.Key_Equal):  # + or = key
+                self.slide_viewer.zoom_in()
+                return
+            elif key == Qt.Key_Minus:
+                self.slide_viewer.zoom_out()
+                return
+            elif key == Qt.Key_0:
+                self.slide_viewer.reset_zoom()
+                return
+
+        # Navigation
+        if key in (Qt.Key_Right, Qt.Key_Space):
             self._scroll_to_next()
-        elif event.key() in (Qt.Key_Left, Qt.Key_Backspace):
+        elif key in (Qt.Key_Left, Qt.Key_Backspace):
             self._scroll_to_previous()
-        elif event.key() == Qt.Key_Home:
+        elif key in (Qt.Key_PageDown, Qt.Key_Down):
+            self._scroll_to_next()
+        elif key in (Qt.Key_PageUp, Qt.Key_Up):
+            self._scroll_to_previous()
+        elif key == Qt.Key_Home:
             self.go_to_slide(0)
-        elif event.key() == Qt.Key_End:
+        elif key == Qt.Key_End:
             self.go_to_slide(self.total_slides - 1)
-        elif event.key() == Qt.Key_Escape:
-            self.close()
+        elif key == Qt.Key_Escape:
+            # Clear focus instead of closing
+            self.setFocus()
         else:
             super().keyPressEvent(event)
 

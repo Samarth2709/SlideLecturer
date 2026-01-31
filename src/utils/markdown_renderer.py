@@ -76,6 +76,16 @@ class MarkdownRenderer:
     def _apply_inline_styles(self, html: str) -> str:
         """Apply inline styles to HTML elements for QLabel compatibility."""
         # QLabel has limited CSS support, so we use inline styles
+        
+        # Handle fenced code blocks FIRST (before inline code)
+        # These come as <pre><code>...</code></pre> from markdown2
+        html = re.sub(
+            r'<pre><code(?:\s+class="[^"]*")?>(.*?)</code></pre>',
+            lambda m: self._style_code_block(m.group(1)),
+            html,
+            flags=re.DOTALL
+        )
+        
         # Replace heading tags with styled versions
         html = re.sub(
             r'<h1>(.*?)</h1>',
@@ -98,12 +108,11 @@ class MarkdownRenderer:
             html
         )
 
-        # Style code blocks (both inline and block)
+        # Style inline code (not inside pre blocks, which are already handled)
         html = re.sub(
             r'<code>(.*?)</code>',
             f'<span style="background-color: {self.CODE_BG}; color: {self.CODE_COLOR}; padding: 2px 5px; font-family: monospace;">\\1</span>',
-            html,
-            flags=re.DOTALL
+            html
         )
 
         # Style links
@@ -120,7 +129,7 @@ class MarkdownRenderer:
             html
         )
 
-        # Clean up pre tags (QLabel doesn't handle them well)
+        # Clean up any remaining pre tags (shouldn't be any after code block handling)
         html = re.sub(
             r'<pre>(.*?)</pre>',
             r'<p>\1</p>',
@@ -129,6 +138,34 @@ class MarkdownRenderer:
         )
 
         return html
+
+    def _style_code_block(self, code_content: str) -> str:
+        """Style a fenced code block with proper formatting.
+        
+        Args:
+            code_content: The code inside the block (may contain newlines)
+            
+        Returns:
+            Styled HTML for the code block with preserved line breaks
+        """
+        # Convert newlines to <br> for proper display in QLabel
+        # Also preserve leading spaces by converting to &nbsp;
+        lines = code_content.split('\n')
+        styled_lines = []
+        for line in lines:
+            # Preserve leading whitespace
+            leading_spaces = len(line) - len(line.lstrip(' '))
+            line = '&nbsp;' * leading_spaces + self._escape_html(line.lstrip(' '))
+            styled_lines.append(line)
+        
+        formatted_code = '<br>'.join(styled_lines)
+        
+        return (
+            f'<div style="background-color: {self.CODE_BG}; '
+            f'padding: 10px; margin: 8px 0; border-radius: 6px;">'
+            f'<span style="color: {self.CODE_COLOR}; font-family: monospace; '
+            f'white-space: pre-wrap;">{formatted_code}</span></div>'
+        )
 
     def _escape_html(self, text: str) -> str:
         """Escape HTML special characters."""
@@ -243,3 +280,67 @@ def render_markdown(text: str) -> str:
         HTML string with dark mode styling
     """
     return get_renderer().render(text)
+
+
+def render_markdown_streaming(text: str) -> str:
+    """Render markdown that may be incomplete (during streaming).
+    
+    This function handles partial markdown gracefully by completing
+    unclosed syntax before rendering to avoid broken HTML.
+
+    Args:
+        text: Markdown formatted text (possibly incomplete)
+
+    Returns:
+        HTML string with dark mode styling
+    """
+    if not text:
+        return ""
+    
+    # Complete any unclosed markdown syntax to prevent broken HTML
+    text = _complete_partial_markdown(text)
+    
+    return get_renderer().render(text)
+
+
+def _complete_partial_markdown(text: str) -> str:
+    """Complete unclosed markdown syntax for cleaner streaming display.
+    
+    Args:
+        text: Potentially incomplete markdown text
+        
+    Returns:
+        Text with unclosed syntax completed
+    """
+    # Handle unclosed bold/italic markers
+    # Count ** markers (bold)
+    bold_count = text.count('**')
+    if bold_count % 2 != 0:
+        # Unclosed bold - close it at the end
+        text += '**'
+    
+    # Count * markers (italic) - but not ** 
+    # Replace ** temporarily to count single *
+    temp = text.replace('**', '\x00\x00')
+    italic_count = temp.count('*')
+    if italic_count % 2 != 0:
+        text += '*'
+    
+    # Handle unclosed inline code
+    # Count ` markers (but not ```)
+    temp = text.replace('```', '\x00\x00\x00')
+    backtick_count = temp.count('`')
+    if backtick_count % 2 != 0:
+        text += '`'
+    
+    # Handle unclosed fenced code blocks
+    fence_count = text.count('```')
+    if fence_count % 2 != 0:
+        text += '\n```'
+    
+    # Handle unclosed strikethrough
+    strike_count = text.count('~~')
+    if strike_count % 2 != 0:
+        text += '~~'
+    
+    return text

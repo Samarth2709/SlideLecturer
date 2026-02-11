@@ -60,6 +60,7 @@ class SlideWidget(QFrame):
         # Frame style and cursor
         self.setStyleSheet("background-color: transparent;")
         self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Click to focus this slide for AI questions")
 
     def _apply_focused_style(self):
         """Apply focused (green border) style to the image label."""
@@ -88,8 +89,10 @@ class SlideWidget(QFrame):
         self._is_focused = focused
         if focused:
             self._apply_focused_style()
+            self.setToolTip("Click again to unfocus this slide")
         else:
             self._apply_unfocused_style()
+            self.setToolTip("Click to focus this slide for AI questions")
 
     @property
     def is_focused(self) -> bool:

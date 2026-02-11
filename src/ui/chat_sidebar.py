@@ -302,6 +302,8 @@ class ChatSidebar(QWidget):
         input_layout.addWidget(self.input_field)
 
         self.send_btn = QPushButton("Send")
+        self.send_btn.setToolTip("Send message to AI (Enter)")
+        self.send_btn.setCursor(Qt.PointingHandCursor)
         self.send_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: {Theme.PRIMARY};

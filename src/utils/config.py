@@ -5,6 +5,14 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
+from dotenv import load_dotenv
+
+
+# Load .env file from project root on module import
+# override=True ensures .env values take precedence over existing environment variables
+_env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(_env_path, override=True)
+
 
 @dataclass
 class Config:
@@ -19,27 +27,12 @@ class Config:
 
 
 def get_api_key() -> Optional[str]:
-    """Get Anthropic API key from environment or .env file.
+    """Get Anthropic API key from environment.
 
-    Checks in order:
-    1. ANTHROPIC_API_KEY environment variable
-    2. .env file in project root
+    The .env file is automatically loaded into the environment
+    when this module is imported.
     """
-    # Check environment variable first
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        return api_key
-
-    # Try loading from .env file
-    env_path = Path(__file__).parent.parent.parent / ".env"
-    if env_path.exists():
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("ANTHROPIC_API_KEY="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
-
-    return None
+    return os.environ.get("ANTHROPIC_API_KEY")
 
 
 def load_config() -> Config:

@@ -4,19 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SlideLecturer is a PyQt5 desktop application for viewing lecture slides (PDF/PPTX) with an AI-powered chat sidebar that helps users learn from the content. The AI has context of both the current slide and the entire deck.
+SlideLecturer is a web application for viewing lecture slides (PDF/PPTX) with an AI-powered chat interface.
 
 ## Commands
 
 ```bash
-# Install dependencies
+# Backend
+cd backend
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
 
-# Run the app
-python main.py /path/to/slides.pdf
-python main.py /path/to/presentation.pptx
+# Frontend
+cd web
+npm install
+npm run dev
 
-# Set API key (required for AI features)
+# API key (required for AI features)
 export ANTHROPIC_API_KEY=your_key_here
 # Or create .env file from template: cp .env.example .env
 ```
@@ -24,54 +29,50 @@ export ANTHROPIC_API_KEY=your_key_here
 ## Architecture
 
 ```
-src/
-├── ui/           # PyQt5 widgets (main window, viewers, chat)
-├── services/     # Business logic (AI client, slide loading)
-├── models/       # Data classes (Slide, ChatMessage)
-├── prompts/      # AI prompt templates (txt files)
-└── utils/        # Config, theming, markdown rendering
+backend/
+├── app/main.py              # FastAPI routes
+├── app/services/deck_service.py
+├── app/services/ai_service.py
+└── app/prompts/             # Prompt templates
+
+web/
+├── src/App.jsx              # Main React app
+├── src/App.css              # Styling
+└── vite.config.js
 ```
 
 ### Key Components
 
-- **main.py** → Entry point; validates file, initializes AI service, applies global theme, launches MainWindow
-- **src/ui/main_window.py** → QMainWindow with collapsible QSplitter; slide container can be fully hidden
-- **src/ui/continuous_slide_viewer.py** → PDF-like scrollable view of all slides; emits `current_slide_changed` signal based on scroll position
-- **src/ui/chat_sidebar.py** → Chat widget with streaming responses via QThread worker; renders AI responses as markdown
-- **src/services/slide_loader.py** → Abstract SlideLoader with PDF/PPTX implementations; extracts both images and text
-- **src/services/ai_service.py** → Claude API client; sends entire PDF as document attachment with prompt caching
-- **src/prompts/** → AI prompt templates loaded from txt files (system_prompt.txt, user_prompt.txt, focus_prompt.txt)
-- **src/utils/theme.py** → Centralized dark mode theme constants and stylesheet generators
-- **src/utils/markdown_renderer.py** → Converts markdown to HTML with inline styles for QLabel
+- **`backend/app/main.py`** → API endpoints for deck lifecycle, slides, and chat streaming
+- **`backend/app/services/deck_service.py`** → PDF/PPTX ingest, conversion, text extraction, image rendering
+- **`backend/app/services/ai_service.py`** → Claude streaming with deck + optional focus-slide context
+- **`web/src/App.jsx`** → Upload, continuous slide view, focus mode, and streaming chat UI
 
 ### Data Flow
 
-1. SlideLoader extracts slide images + text from PDF/PPTX
-2. ContinuousSlideViewer displays all slides in a scrollable view
-3. Scrolling triggers `current_slide_changed` → updates ChatSidebar context
-4. ChatSidebar sends questions to AIService with PDF attachment
-5. AIService streams responses → rendered as markdown in chat bubbles
+1. Frontend uploads deck to backend
+2. Backend extracts slide metadata and serves rendered PNGs/text
+3. Frontend tracks current and focused slide context
+4. Frontend calls chat stream endpoint (SSE) with question + context
+5. Backend streams AI chunks back to frontend chat UI
 
 ### AI Modes
 
-- **Non-focus mode**: Sends entire PDF as document attachment + user question
-- **Focus mode**: Sends PDF + focused slide image (PNG) + user question; triggered when user clicks a slide
-- Both modes maintain conversation history (text only, not PDF/images)
-- PDF is sent with each API call; Anthropic prompt caching handles efficiency
+- **Non-focus mode**: sends full deck PDF + question
+- **Focus mode**: sends full deck PDF + focused slide image + question
+- Conversation history is stored per deck session (text only)
 
 ## Key Dependencies
 
-- **PyQt5** - GUI framework
+- **FastAPI** - backend API server
 - **PyMuPDF (fitz)** - PDF rendering and text extraction
 - **anthropic** - Claude API client
-- **markdown2** - Markdown to HTML conversion
-- **LibreOffice** - External requirement for PPTX (converts to PDF)
+- **React + Vite** - frontend UI
+- **LibreOffice** - required for PPTX conversion to PDF
 
 ## Notes
 
-- PPTX support requires LibreOffice installed on the system
-- AI features require ANTHROPIC_API_KEY environment variable or .env file
-- **PDF limit**: Anthropic API allows max 100 pages per PDF document
-- Slides rendered at 2x resolution for quality
-- Chat uses streaming for real-time response display
-- Theme uses dark mode with indigo accent (#6366f1)
+- Desktop app code has been removed
+- PPTX support still requires LibreOffice on the backend host
+- AI features require `ANTHROPIC_API_KEY`
+- API streaming uses SSE (`/api/v1/decks/{deck_id}/chat/stream`)

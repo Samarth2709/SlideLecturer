@@ -94,4 +94,4 @@ Reimplement the current desktop app as a web system with:
 ## Implemented Structure
 - `backend/` now contains FastAPI API, deck service, AI service, and prompt templates
 - `web/` now contains React/Vite app with upload, viewer, focus mode, and streaming chat
-- Existing desktop app under `src/` is left intact for backward compatibility during migration
+- Legacy desktop app code has been removed from the repository

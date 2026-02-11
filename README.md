@@ -1,10 +1,8 @@
 # SlideLecturer
 
-SlideLecturer now includes both:
-- Existing desktop app (`PyQt5`) under `src/`
-- New web app stack:
-  - Node.js frontend (`web/`)
-  - Python FastAPI backend (`backend/`)
+SlideLecturer is a web application with:
+- Node.js frontend (`web/`)
+- Python FastAPI backend (`backend/`)
 
 ## Web App Architecture
 - Frontend: React + Vite (`web/`)
@@ -48,10 +46,3 @@ Frontend runs on `http://localhost:5173` and proxies `/api/*` to `http://localho
 - `POST /api/v1/decks/{deck_id}/chat/stream` (SSE)
 - `POST /api/v1/decks/{deck_id}/chat/clear`
 - `DELETE /api/v1/decks/{deck_id}`
-
-## Desktop App (Existing)
-Desktop app remains runnable:
-```bash
-pip install -r requirements.txt
-python main.py /path/to/slides.pdf
-```

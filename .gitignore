@@ -21,3 +21,12 @@ test_slides.pdf
 .pptx
 /slides/
 /tests
+
+# Web app
+/web/node_modules/
+/web/dist/
+/web/.vite/
+
+# Web backend runtime
+/backend/.data/
+/backend/.venv/

@@ -1,5 +1,6 @@
 """Configuration management for SlideLecturer."""
 
+import stat
 import os
 from pathlib import Path
 from dataclasses import dataclass
@@ -8,10 +9,34 @@ from typing import Optional
 from dotenv import load_dotenv
 
 
-# Load .env file from project root on module import
-# override=True ensures .env values take precedence over existing environment variables
 _env_path = Path(__file__).parent.parent.parent / ".env"
-load_dotenv(_env_path, override=True)
+
+
+def _load_dotenv_if_available(env_path: Path) -> None:
+    """Load .env only when the file is locally available.
+
+    On macOS with iCloud optimization enabled, files can appear but be
+    marked as dataless placeholders. Accessing them may block.
+    """
+    try:
+        metadata = env_path.stat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+    dataless_flag = getattr(stat, "SF_DATALESS", 0)
+    if dataless_flag and (metadata.st_flags & dataless_flag):
+        return
+
+    try:
+        load_dotenv(env_path, override=True)
+    except OSError:
+        # Ignore transient file-provider errors.
+        return
+
+
+_load_dotenv_if_available(_env_path)
 
 
 @dataclass

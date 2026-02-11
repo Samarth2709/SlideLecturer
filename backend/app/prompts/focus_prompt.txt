@@ -1,0 +1,3 @@
+I'm focusing on Slide {slide_number}. The slide image is shown above along with the full PDF deck.
+
+My question about this slide: {question}

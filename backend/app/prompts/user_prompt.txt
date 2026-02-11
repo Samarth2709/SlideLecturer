@@ -1,0 +1,3 @@
+The slide deck PDF has been provided above. Please answer the following question about the slides:
+
+{question}

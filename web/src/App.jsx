@@ -21,6 +21,8 @@ const SPLIT_MAX_RATIO = 0.8;
 const SPLIT_MIN_PANEL_PX = 320;
 const SPLITTER_WIDTH_PX = 12;
 const TRANSCRIPT_POLL_INTERVAL_MS = 1800;
+const DECK_PREFERENCES_STORAGE_PREFIX = 'slidelecturer.deckPreferences.v1';
+const SEARCH_SNIPPET_MAX_CHARS = 180;
 
 const EMPTY_TRANSCRIPT_STATE = Object.freeze({
   status: 'queued',
@@ -35,6 +37,176 @@ function buildEmptyTranscriptState(totalSlides = 0) {
     ...EMPTY_TRANSCRIPT_STATE,
     total_slides: totalSlides,
   };
+}
+
+function buildDeckPreferenceStorageKey(deck) {
+  if (!deck?.filename) {
+    return '';
+  }
+
+  const filename = String(deck.filename || '').trim().toLowerCase();
+  const slideCount = Number(deck.slide_count || 0);
+  if (!filename || !Number.isInteger(slideCount) || slideCount <= 0) {
+    return '';
+  }
+
+  return `${DECK_PREFERENCES_STORAGE_PREFIX}:${filename}:${slideCount}`;
+}
+
+function sanitizeStoredBookmarkedSlides(value, totalSlides) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const upperBound = Number.isInteger(totalSlides) ? totalSlides - 1 : -1;
+  const seen = new Set();
+  for (const candidate of value) {
+    const index = Number(candidate);
+    if (!Number.isInteger(index)) {
+      continue;
+    }
+    if (index < 0 || index > upperBound || seen.has(index)) {
+      continue;
+    }
+    seen.add(index);
+  }
+
+  return Array.from(seen).sort((first, second) => first - second);
+}
+
+function sanitizeStoredNotesBySlide(value, totalSlides) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+
+  const upperBound = Number.isInteger(totalSlides) ? totalSlides - 1 : -1;
+  const normalized = {};
+
+  for (const [rawIndex, rawNote] of Object.entries(value)) {
+    const index = Number(rawIndex);
+    if (!Number.isInteger(index) || index < 0 || index > upperBound) {
+      continue;
+    }
+
+    const note = String(rawNote || '');
+    if (!note.trim()) {
+      continue;
+    }
+
+    normalized[index] = note;
+  }
+
+  return normalized;
+}
+
+function loadDeckPreferences(storageKey, totalSlides) {
+  if (typeof window === 'undefined' || !storageKey) {
+    return {
+      bookmarks: [],
+      notesBySlide: {},
+    };
+  }
+
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    if (!raw) {
+      return {
+        bookmarks: [],
+        notesBySlide: {},
+      };
+    }
+
+    const parsed = JSON.parse(raw);
+    return {
+      bookmarks: sanitizeStoredBookmarkedSlides(parsed?.bookmarks, totalSlides),
+      notesBySlide: sanitizeStoredNotesBySlide(parsed?.notesBySlide, totalSlides),
+    };
+  } catch (error) {
+    console.warn('Failed to load deck preferences from local storage', error);
+    return {
+      bookmarks: [],
+      notesBySlide: {},
+    };
+  }
+}
+
+function persistDeckPreferences(storageKey, totalSlides, payload) {
+  if (typeof window === 'undefined' || !storageKey) {
+    return;
+  }
+
+  try {
+    const normalizedPayload = {
+      bookmarks: sanitizeStoredBookmarkedSlides(payload?.bookmarks, totalSlides),
+      notesBySlide: sanitizeStoredNotesBySlide(payload?.notesBySlide, totalSlides),
+    };
+    window.localStorage.setItem(storageKey, JSON.stringify(normalizedPayload));
+  } catch (error) {
+    console.warn('Failed to persist deck preferences to local storage', error);
+  }
+}
+
+function buildSearchSnippet(rawText, normalizedQuery, maxChars = SEARCH_SNIPPET_MAX_CHARS) {
+  const text = String(rawText || '').replace(/\s+/g, ' ').trim();
+  if (!text) {
+    return '';
+  }
+
+  const query = String(normalizedQuery || '').toLowerCase().trim();
+  if (!query) {
+    return text.slice(0, maxChars);
+  }
+
+  const lowerText = text.toLowerCase();
+  const matchIndex = lowerText.indexOf(query);
+  if (matchIndex < 0) {
+    return text.slice(0, maxChars);
+  }
+
+  const contextPadding = Math.max(24, Math.floor((maxChars - query.length) / 2));
+  const start = Math.max(0, matchIndex - contextPadding);
+  const end = Math.min(text.length, matchIndex + query.length + contextPadding);
+  const prefix = start > 0 ? '...' : '';
+  const suffix = end < text.length ? '...' : '';
+
+  return `${prefix}${text.slice(start, end)}${suffix}`;
+}
+
+function splitTextForHighlight(text, query) {
+  const input = String(text || '');
+  const normalizedQuery = String(query || '').trim();
+  if (!normalizedQuery) {
+    return [{ text: input, isMatch: false }];
+  }
+
+  const normalizedInput = input.toLowerCase();
+  const normalizedNeedle = normalizedQuery.toLowerCase();
+  const output = [];
+  let cursor = 0;
+
+  while (cursor < input.length) {
+    const matchIndex = normalizedInput.indexOf(normalizedNeedle, cursor);
+    if (matchIndex === -1) {
+      output.push({ text: input.slice(cursor), isMatch: false });
+      break;
+    }
+
+    if (matchIndex > cursor) {
+      output.push({ text: input.slice(cursor, matchIndex), isMatch: false });
+    }
+
+    output.push({
+      text: input.slice(matchIndex, matchIndex + normalizedNeedle.length),
+      isMatch: true,
+    });
+    cursor = matchIndex + normalizedNeedle.length;
+  }
+
+  if (!output.length) {
+    return [{ text: input, isMatch: false }];
+  }
+
+  return output;
 }
 
 function describeTranscriptGeneration(state) {
@@ -611,6 +783,11 @@ function App() {
   const [slidesVisible, setSlidesVisible] = useState(true);
   const [transcriptState, setTranscriptState] = useState(() => buildEmptyTranscriptState());
   const [activeTranscriptSlideIndex, setActiveTranscriptSlideIndex] = useState(null);
+  const [activeNotesSlideIndex, setActiveNotesSlideIndex] = useState(null);
+  const [bookmarkedSlideIndices, setBookmarkedSlideIndices] = useState([]);
+  const [showBookmarkedOnly, setShowBookmarkedOnly] = useState(false);
+  const [notesBySlide, setNotesBySlide] = useState({});
+  const [slideSearchQuery, setSlideSearchQuery] = useState('');
   const [splitRatio, setSplitRatio] = useState(() => loadInitialSplitRatio());
   const [isResizingSplit, setIsResizingSplit] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
@@ -619,6 +796,7 @@ function App() {
   const slideScrollRef = useRef(null);
   const slideRefs = useRef([]);
   const inputRef = useRef(null);
+  const slideSearchInputRef = useRef(null);
   const fileInputRef = useRef(null);
   const messagesEndRef = useRef(null);
   const currentSlideIndexRef = useRef(0);
@@ -629,6 +807,7 @@ function App() {
   const queuedMessagesByBranchRef = useRef(queuedMessagesByBranch);
   const editingQueuedMessageIdRef = useRef(editingQueuedMessageId);
   const activeBranchIdRef = useRef(activeBranchId);
+  const clearingChatRef = useRef(clearingChat);
   const sendingRef = useRef(sending);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
@@ -955,6 +1134,10 @@ function App() {
   }, [activeBranchId]);
 
   useEffect(() => {
+    clearingChatRef.current = clearingChat;
+  }, [clearingChat]);
+
+  useEffect(() => {
     sendingRef.current = sending;
   }, [sending]);
 
@@ -1183,6 +1366,10 @@ function App() {
 
   const handleContextNodeClick = useCallback(
     (node) => {
+      if (sendingRef.current || clearingChatRef.current) {
+        return;
+      }
+
       if (!node || !node.canBranch || !node.sourceBranchId || !node.sourceMessageId) {
         return;
       }
@@ -1324,22 +1511,6 @@ function App() {
     return () => window.removeEventListener('keydown', handleEscape);
   }, [isBranchMapOpen]);
 
-  useEffect(() => {
-    if (activeTranscriptSlideIndex === null) {
-      return;
-    }
-
-    const handleEscape = (event) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        setActiveTranscriptSlideIndex(null);
-      }
-    };
-
-    window.addEventListener('keydown', handleEscape);
-    return () => window.removeEventListener('keydown', handleEscape);
-  }, [activeTranscriptSlideIndex]);
-
   const hasDeck = Boolean(deck?.deck_id);
   const splitPercentage = Number((splitRatio * 100).toFixed(1));
   const transcriptsBySlide = useMemo(() => {
@@ -1353,6 +1524,185 @@ function App() {
     () => describeTranscriptGeneration(transcriptState),
     [transcriptState]
   );
+  const deckPreferenceStorageKey = useMemo(
+    () => buildDeckPreferenceStorageKey(deck),
+    [deck]
+  );
+  const bookmarkedSlideSet = useMemo(
+    () => new Set(bookmarkedSlideIndices),
+    [bookmarkedSlideIndices]
+  );
+  const slidesToRender = useMemo(() => {
+    if (!showBookmarkedOnly) {
+      return slides;
+    }
+    return slides.filter((slide) => bookmarkedSlideSet.has(slide.index));
+  }, [bookmarkedSlideSet, showBookmarkedOnly, slides]);
+  const navigableSlideIndices = useMemo(
+    () => slidesToRender.map((slide) => slide.index),
+    [slidesToRender]
+  );
+  const normalizedSlideSearchQuery = useMemo(
+    () => slideSearchQuery.trim().toLowerCase(),
+    [slideSearchQuery]
+  );
+  const slideSearchResults = useMemo(() => {
+    if (!normalizedSlideSearchQuery) {
+      return [];
+    }
+
+    const results = [];
+
+    for (const slide of slides) {
+      const slideIndex = slide.index;
+      const transcriptEntry = transcriptsBySlide.get(slideIndex);
+      const note = String(notesBySlide[slideIndex] || '');
+      const transcript = String(transcriptEntry?.transcript || '');
+      const preview = String(slide.text_preview || '');
+
+      const normalizedNote = note.toLowerCase();
+      const normalizedTranscript = transcript.toLowerCase();
+      const normalizedPreview = preview.toLowerCase();
+
+      let score = 0;
+      let snippet = '';
+      let matchedSource = '';
+
+      if (normalizedNote.includes(normalizedSlideSearchQuery)) {
+        score += 5;
+        if (!snippet) {
+          snippet = buildSearchSnippet(note, normalizedSlideSearchQuery);
+          matchedSource = 'Notes';
+        }
+      }
+
+      if (normalizedTranscript.includes(normalizedSlideSearchQuery)) {
+        score += 4;
+        if (!snippet) {
+          snippet = buildSearchSnippet(transcript, normalizedSlideSearchQuery);
+          matchedSource = 'Transcript';
+        }
+      }
+
+      if (normalizedPreview.includes(normalizedSlideSearchQuery)) {
+        score += 2;
+        if (!snippet) {
+          snippet = buildSearchSnippet(preview, normalizedSlideSearchQuery);
+          matchedSource = 'Slide text';
+        }
+      }
+
+      if (score === 0) {
+        continue;
+      }
+
+      if (bookmarkedSlideSet.has(slideIndex)) {
+        score += 1;
+      }
+
+      results.push({
+        slideIndex,
+        score,
+        snippet,
+        source: matchedSource || 'Slide text',
+        isBookmarked: bookmarkedSlideSet.has(slideIndex),
+      });
+    }
+
+    results.sort((first, second) => {
+      if (second.score !== first.score) {
+        return second.score - first.score;
+      }
+      return first.slideIndex - second.slideIndex;
+    });
+
+    return results.slice(0, 30);
+  }, [bookmarkedSlideSet, normalizedSlideSearchQuery, notesBySlide, slides, transcriptsBySlide]);
+
+  useEffect(() => {
+    const totalSlides = Number(deck?.slide_count || 0);
+    if (!deckPreferenceStorageKey || !totalSlides) {
+      setBookmarkedSlideIndices([]);
+      setShowBookmarkedOnly(false);
+      setNotesBySlide({});
+      setSlideSearchQuery('');
+      setActiveNotesSlideIndex(null);
+      return;
+    }
+
+    const loaded = loadDeckPreferences(deckPreferenceStorageKey, totalSlides);
+    setBookmarkedSlideIndices(loaded.bookmarks);
+    setNotesBySlide(loaded.notesBySlide);
+    setShowBookmarkedOnly(false);
+    setSlideSearchQuery('');
+    setActiveNotesSlideIndex(null);
+  }, [deck?.slide_count, deckPreferenceStorageKey]);
+
+  useEffect(() => {
+    const totalSlides = Number(deck?.slide_count || 0);
+    if (!deckPreferenceStorageKey || !totalSlides) {
+      return;
+    }
+
+    persistDeckPreferences(deckPreferenceStorageKey, totalSlides, {
+      bookmarks: bookmarkedSlideIndices,
+      notesBySlide,
+    });
+  }, [bookmarkedSlideIndices, deck?.slide_count, deckPreferenceStorageKey, notesBySlide]);
+
+  useEffect(() => {
+    if (!showBookmarkedOnly) {
+      return;
+    }
+
+    if (bookmarkedSlideIndices.length) {
+      return;
+    }
+
+    setShowBookmarkedOnly(false);
+  }, [bookmarkedSlideIndices.length, showBookmarkedOnly]);
+
+  useEffect(() => {
+    if (!showBookmarkedOnly || !slidesToRender.length) {
+      return;
+    }
+
+    const isCurrentVisible = slidesToRender.some((slide) => slide.index === currentSlideIndexRef.current);
+    if (isCurrentVisible) {
+      return;
+    }
+
+    const firstVisible = slidesToRender[0];
+    if (!firstVisible) {
+      return;
+    }
+
+    setCurrentSlideIndex(firstVisible.index);
+  }, [showBookmarkedOnly, slidesToRender]);
+
+  useEffect(() => {
+    const hasOverlay = activeTranscriptSlideIndex !== null || activeNotesSlideIndex !== null;
+    if (!hasOverlay) {
+      return;
+    }
+
+    const handleEscape = (event) => {
+      if (event.key !== 'Escape') {
+        return;
+      }
+
+      event.preventDefault();
+      if (activeNotesSlideIndex !== null) {
+        setActiveNotesSlideIndex(null);
+        return;
+      }
+
+      setActiveTranscriptSlideIndex(null);
+    };
+
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [activeNotesSlideIndex, activeTranscriptSlideIndex]);
 
   const clampSplitRatio = useCallback((ratio, containerWidth = 0) => {
     const safeRatio = Number.isFinite(ratio) ? ratio : DEFAULT_SPLIT_RATIO;
@@ -1605,6 +1955,87 @@ function App() {
     return apiUrl(`/api/v1/decks/${deck.deck_id}/slides/${index}/image?scale=2`);
   }
 
+  function toggleBookmarkedFilter() {
+    setShowBookmarkedOnly((previous) => {
+      const next = !previous;
+      if (!next) {
+        return next;
+      }
+
+      const firstBookmarked = bookmarkedSlideIndices[0];
+      if (firstBookmarked !== undefined) {
+        window.setTimeout(() => {
+          scrollToSlide(firstBookmarked);
+        }, 0);
+      }
+
+      return next;
+    });
+  }
+
+  function toggleBookmark(slideIndex) {
+    setBookmarkedSlideIndices((previous) => {
+      const alreadyBookmarked = previous.includes(slideIndex);
+      if (alreadyBookmarked) {
+        return previous.filter((index) => index !== slideIndex);
+      }
+      return [...previous, slideIndex].sort((first, second) => first - second);
+    });
+  }
+
+  function toggleSlideNotes(slideIndex) {
+    setActiveNotesSlideIndex((previous) => (previous === slideIndex ? null : slideIndex));
+  }
+
+  function handleSlideNoteChange(slideIndex, noteValue) {
+    const nextNote = String(noteValue || '');
+    setNotesBySlide((previous) => {
+      const hasExisting = Object.prototype.hasOwnProperty.call(previous, slideIndex);
+      if (!nextNote.trim()) {
+        if (!hasExisting) {
+          return previous;
+        }
+        const nextState = { ...previous };
+        delete nextState[slideIndex];
+        return nextState;
+      }
+
+      if (hasExisting && previous[slideIndex] === nextNote) {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        [slideIndex]: nextNote,
+      };
+    });
+  }
+
+  function jumpToSearchResult(slideIndex) {
+    if (!Number.isInteger(slideIndex) || slideIndex < 0) {
+      return;
+    }
+
+    if (showBookmarkedOnly) {
+      setShowBookmarkedOnly(false);
+    }
+
+    window.setTimeout(() => {
+      scrollToSlide(slideIndex);
+    }, 0);
+  }
+
+  function renderSearchSnippetWithHighlights(snippet) {
+    const segments = splitTextForHighlight(snippet, slideSearchQuery);
+    return segments.map((segment, index) =>
+      segment.isMatch ? (
+        <mark key={`match-${index}`}>{segment.text}</mark>
+      ) : (
+        <span key={`text-${index}`}>{segment.text}</span>
+      )
+    );
+  }
+
   function toggleFocus(index) {
     setFocusedSlideIndex((prev) => (prev === index ? null : index));
   }
@@ -1618,17 +2049,63 @@ function App() {
   }
 
   function scrollToSlide(index) {
-    const clamped = Math.max(0, Math.min(index, slides.length - 1));
+    if (!slides.length) {
+      return;
+    }
+
+    const numericIndex = Number(index);
+    if (!Number.isFinite(numericIndex)) {
+      return;
+    }
+
+    const clamped = Math.max(0, Math.min(Math.round(numericIndex), slides.length - 1));
     const target = slideRefs.current[clamped];
     if (target) {
       target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      setCurrentSlideIndex(clamped);
     }
+    setCurrentSlideIndex(clamped);
+  }
+
+  function scrollToRelativeSlide(offset) {
+    if (!navigableSlideIndices.length || !Number.isInteger(offset) || offset === 0) {
+      return;
+    }
+
+    const currentIndex = currentSlideIndexRef.current;
+    const currentPosition = navigableSlideIndices.indexOf(currentIndex);
+    const basePosition =
+      currentPosition >= 0
+        ? currentPosition
+        : offset > 0
+          ? -1
+          : navigableSlideIndices.length;
+
+    const nextPosition = Math.max(
+      0,
+      Math.min(basePosition + offset, navigableSlideIndices.length - 1)
+    );
+    const nextSlideIndex = navigableSlideIndices[nextPosition];
+    if (nextSlideIndex !== undefined) {
+      scrollToSlide(nextSlideIndex);
+    }
+  }
+
+  function scrollToVisibleEdge(direction) {
+    if (!navigableSlideIndices.length) {
+      return;
+    }
+
+    if (direction === 'start') {
+      scrollToSlide(navigableSlideIndices[0]);
+      return;
+    }
+
+    scrollToSlide(navigableSlideIndices[navigableSlideIndices.length - 1]);
   }
 
   useEffect(() => {
     const container = slideScrollRef.current;
-    if (!container || !slides.length) {
+    if (!container || !slidesToRender.length) {
       return;
     }
 
@@ -1638,9 +2115,14 @@ function App() {
       const targetTop = viewportTop + viewportHeight / 3;
 
       let bestIndex = currentSlideIndexRef.current;
+      if (!slidesToRender.some((slide) => slide.index === bestIndex)) {
+        bestIndex = slidesToRender[0].index;
+      }
       let bestDistance = Number.POSITIVE_INFINITY;
 
-      slideRefs.current.forEach((node, index) => {
+      slidesToRender.forEach((slide) => {
+        const index = slide.index;
+        const node = slideRefs.current[index];
         if (!node) {
           return;
         }
@@ -1674,7 +2156,7 @@ function App() {
       container.removeEventListener('scroll', handleScroll);
       window.removeEventListener('resize', updateCurrentSlide);
     };
-  }, [slides, slidesVisible]);
+  }, [slidesToRender, slidesVisible]);
 
   useEffect(() => {
     const handleKeyDown = (event) => {
@@ -1692,6 +2174,12 @@ function App() {
 
       const { key, ctrlKey, metaKey } = event;
       const hasModifier = ctrlKey || metaKey;
+
+      if (key === '/' && !hasModifier) {
+        event.preventDefault();
+        slideSearchInputRef.current?.focus();
+        return;
+      }
 
       if (hasModifier) {
         return;
@@ -1711,22 +2199,28 @@ function App() {
 
       if ([' ', 'PageDown', 'ArrowDown'].includes(key)) {
         event.preventDefault();
-        scrollToSlide(currentSlideIndexRef.current + 1);
+        scrollToRelativeSlide(1);
       } else if (['Backspace', 'PageUp', 'ArrowUp'].includes(key)) {
         event.preventDefault();
-        scrollToSlide(currentSlideIndexRef.current - 1);
+        scrollToRelativeSlide(-1);
       } else if (key === 'Home') {
         event.preventDefault();
-        scrollToSlide(0);
+        scrollToVisibleEdge('start');
       } else if (key === 'End') {
         event.preventDefault();
-        scrollToSlide(slides.length - 1);
+        scrollToVisibleEdge('end');
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [hasDeck, slides.length, branchOrder.length, switchBranchByOffset, isBranchMapOpen]);
+  }, [
+    hasDeck,
+    branchOrder.length,
+    switchBranchByOffset,
+    isBranchMapOpen,
+    navigableSlideIndices,
+  ]);
 
   useEffect(() => {
     if (activeTranscriptSlideIndex === null) {
@@ -1737,6 +2231,16 @@ function App() {
     }
     setActiveTranscriptSlideIndex(null);
   }, [activeTranscriptSlideIndex, slides.length]);
+
+  useEffect(() => {
+    if (activeNotesSlideIndex === null) {
+      return;
+    }
+    if (activeNotesSlideIndex < slides.length) {
+      return;
+    }
+    setActiveNotesSlideIndex(null);
+  }, [activeNotesSlideIndex, slides.length]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -1829,7 +2333,7 @@ function App() {
   const slidesPaneStyle = { flex: `0 0 ${splitPercentage}%` };
 
   async function clearChat() {
-    if (clearingChat || sending) {
+    if (clearingChatRef.current || sendingRef.current) {
       return;
     }
 
@@ -1844,6 +2348,7 @@ function App() {
       return;
     }
 
+    clearingChatRef.current = true;
     setClearingChat(true);
 
     try {
@@ -1864,6 +2369,7 @@ function App() {
     } catch (clearError) {
       setError(normalizeError(clearError, 'Failed to clear chat'));
     } finally {
+      clearingChatRef.current = false;
       setClearingChat(false);
     }
   }
@@ -2045,7 +2551,7 @@ function App() {
   }
 
   function continueQueuedMessagesIfPossible(branchId) {
-    if (sendingRef.current || clearingChat) {
+    if (sendingRef.current || clearingChatRef.current) {
       return;
     }
 
@@ -2062,7 +2568,7 @@ function App() {
   }
 
   async function submitComposerMessage() {
-    if (!deck?.deck_id || clearingChat) {
+    if (!deck?.deck_id || clearingChatRef.current) {
       return;
     }
 
@@ -2107,7 +2613,7 @@ function App() {
   }
 
   async function sendQueuedMessageNow(queuedMessageId) {
-    if (sendingRef.current) {
+    if (sendingRef.current || clearingChatRef.current) {
       return;
     }
 
@@ -2319,7 +2825,7 @@ function App() {
       <ul className={`branch-tree-level ${depth === 0 ? 'root' : 'nested'}`} role={depth === 0 ? 'list' : undefined}>
         {nodes.map((node) => (
           <li key={node.key} className="branch-tree-item">
-            {node.canBranch ? (
+            {node.canBranch && !sending && !clearingChat ? (
               <button
                 type="button"
                 className="branch-context-node interactive"
@@ -2387,13 +2893,64 @@ function App() {
           <>
             <section className="slides-panel" style={slidesPaneStyle}>
               <div className="slides-toolbar">
-                <button
-                  type="button"
-                  className="ghost-btn"
-                  onClick={() => setSlidesVisible(false)}
-                >
-                  Hide Slides
-                </button>
+                <div className="slides-toolbar-main">
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    onClick={() => setSlidesVisible(false)}
+                  >
+                    Hide Slides
+                  </button>
+                  <button
+                    type="button"
+                    className={`ghost-btn ${showBookmarkedOnly ? 'active' : ''}`}
+                    onClick={toggleBookmarkedFilter}
+                    disabled={!bookmarkedSlideIndices.length && !showBookmarkedOnly}
+                    aria-pressed={showBookmarkedOnly}
+                  >
+                    {showBookmarkedOnly ? 'Show All' : `Starred (${bookmarkedSlideIndices.length})`}
+                  </button>
+                </div>
+                <div className="slides-toolbar-search">
+                  <input
+                    ref={slideSearchInputRef}
+                    type="search"
+                    value={slideSearchQuery}
+                    onChange={(event) => setSlideSearchQuery(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        const firstResult = slideSearchResults[0];
+                        if (firstResult) {
+                          jumpToSearchResult(firstResult.slideIndex);
+                        }
+                        return;
+                      }
+
+                      if (event.key === 'Escape') {
+                        event.preventDefault();
+                        if (slideSearchQuery.trim()) {
+                          setSlideSearchQuery('');
+                        } else {
+                          event.currentTarget.blur();
+                        }
+                      }
+                    }}
+                    className="slides-search-input"
+                    placeholder="Search slides, transcripts, notes (/)"
+                    disabled={!slides.length}
+                    aria-label="Search slides, transcripts, and notes"
+                  />
+                  {slideSearchQuery.trim() ? (
+                    <button
+                      type="button"
+                      className="ghost-btn"
+                      onClick={() => setSlideSearchQuery('')}
+                    >
+                      Clear
+                    </button>
+                  ) : null}
+                </div>
                 {transcriptProgressLabel ? (
                   <p
                     className={`transcript-progress transcript-progress-${transcriptState.status}`}
@@ -2404,6 +2961,37 @@ function App() {
                 ) : null}
               </div>
 
+              {normalizedSlideSearchQuery ? (
+                <section className="slide-search-results" aria-live="polite">
+                  <p className="slide-search-summary">
+                    {slideSearchResults.length
+                      ? `${slideSearchResults.length} matching slides`
+                      : `No matches for "${slideSearchQuery.trim()}"`}
+                  </p>
+                  {slideSearchResults.length ? (
+                    <ul className="slide-search-list">
+                      {slideSearchResults.map((result) => (
+                        <li key={`search-result-${result.slideIndex}`}>
+                          <button
+                            type="button"
+                            className="slide-search-item"
+                            onClick={() => jumpToSearchResult(result.slideIndex)}
+                          >
+                            <span className="slide-search-item-title">
+                              Slide {result.slideIndex + 1} · {result.source}
+                              {result.isBookmarked ? ' · Starred' : ''}
+                            </span>
+                            <span className="slide-search-item-snippet">
+                              {renderSearchSnippetWithHighlights(result.snippet)}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </section>
+              ) : null}
+
               <div
                 className="slides-viewer"
                 ref={slideScrollRef}
@@ -2412,79 +3000,139 @@ function App() {
                 tabIndex={0}
               >
                 {slides.length ? (
-                  slides.map((slide) => {
-                    const isFocused = focusedSlideIndex === slide.index;
-                    const isTranscriptOpen = activeTranscriptSlideIndex === slide.index;
-                    const slideTranscript = transcriptsBySlide.get(slide.index) || null;
-                    const hasTranscript = Boolean(slideTranscript?.transcript);
-                    const transcriptStatus = slideTranscript?.status || 'pending';
-                    const transcriptButtonLabel = isTranscriptOpen
-                      ? 'Hide'
-                      : hasTranscript
-                        ? 'Transcript'
-                      : transcriptStatus === 'generating' || transcriptState.status === 'queued'
-                        ? 'Preparing'
-                        : transcriptStatus === 'error'
-                          ? 'Unavailable'
-                          : 'Pending';
-                    return (
-                      <article
-                        key={slide.index}
-                        ref={(node) => {
-                          slideRefs.current[slide.index] = node;
-                        }}
-                        className={`slide-card ${isFocused ? 'focused' : ''}`}
-                        onClick={() => toggleFocus(slide.index)}
-                      >
-                        <p className="slide-label">Slide {slide.index + 1}</p>
-                        {isTranscriptOpen ? (
-                          <section
-                            className="slide-transcript-row"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              closeTranscriptModal();
-                            }}
-                          >
-                            <div className="slide-transcript-row-body">
-                              {hasTranscript ? (
-                                <p className="slide-transcript-row-text">{slideTranscript.transcript}</p>
-                              ) : transcriptStatus === 'error' ? (
-                                <p className="slide-transcript-row-state error">
-                                  {slideTranscript?.error || 'Transcript generation failed for this slide.'}
-                                </p>
-                              ) : transcriptState.status === 'error' ? (
-                                <p className="slide-transcript-row-state error">
-                                  {transcriptState.error || 'Transcript generation ended with errors.'}
-                                </p>
-                              ) : (
-                                <p className="slide-transcript-row-state">
-                                  Transcript is being prepared for this slide.
-                                </p>
-                              )}
-                            </div>
-                          </section>
-                        ) : null}
-                        <div className="slide-image-wrap">
-                          <button
-                            type="button"
-                            className={`slide-transcript-btn ${hasTranscript ? 'ready' : ''}`}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              openTranscriptModal(slide.index);
-                            }}
-                            aria-label={`${isTranscriptOpen ? 'Hide' : 'Open'} transcript for Slide ${slide.index + 1}`}
-                          >
-                            {transcriptButtonLabel}
-                          </button>
-                          <img
-                            src={slideImageUrl(slide.index)}
-                            alt={`Slide ${slide.index + 1}`}
-                            loading="lazy"
-                          />
-                        </div>
-                      </article>
-                    );
-                  })
+                  slidesToRender.length ? (
+                    slidesToRender.map((slide) => {
+                      const isFocused = focusedSlideIndex === slide.index;
+                      const isTranscriptOpen = activeTranscriptSlideIndex === slide.index;
+                      const isNotesOpen = activeNotesSlideIndex === slide.index;
+                      const slideTranscript = transcriptsBySlide.get(slide.index) || null;
+                      const hasTranscript = Boolean(slideTranscript?.transcript);
+                      const hasNotes = Boolean(String(notesBySlide[slide.index] || '').trim());
+                      const isBookmarked = bookmarkedSlideSet.has(slide.index);
+                      const transcriptStatus = slideTranscript?.status || 'pending';
+                      const transcriptButtonLabel = isTranscriptOpen
+                        ? 'Hide'
+                        : hasTranscript
+                          ? 'Transcript'
+                          : transcriptStatus === 'generating' || transcriptState.status === 'queued'
+                            ? 'Preparing'
+                            : transcriptStatus === 'error'
+                              ? 'Unavailable'
+                              : 'Pending';
+                      return (
+                        <article
+                          key={slide.index}
+                          ref={(node) => {
+                            slideRefs.current[slide.index] = node;
+                          }}
+                          className={`slide-card ${isFocused ? 'focused' : ''}`}
+                          onClick={() => toggleFocus(slide.index)}
+                        >
+                          <div className="slide-card-header">
+                            <p className="slide-label">Slide {slide.index + 1}</p>
+                            <button
+                              type="button"
+                              className={`slide-bookmark-btn ${isBookmarked ? 'active' : ''}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleBookmark(slide.index);
+                              }}
+                              aria-label={`${isBookmarked ? 'Remove' : 'Add'} bookmark for Slide ${slide.index + 1}`}
+                              aria-pressed={isBookmarked}
+                            >
+                              {isBookmarked ? 'Starred' : 'Star'}
+                            </button>
+                          </div>
+                          {isTranscriptOpen ? (
+                            <section
+                              className="slide-transcript-row"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                closeTranscriptModal();
+                              }}
+                            >
+                              <div className="slide-transcript-row-body">
+                                {hasTranscript ? (
+                                  <p className="slide-transcript-row-text">{slideTranscript.transcript}</p>
+                                ) : transcriptStatus === 'error' ? (
+                                  <p className="slide-transcript-row-state error">
+                                    {slideTranscript?.error || 'Transcript generation failed for this slide.'}
+                                  </p>
+                                ) : transcriptState.status === 'error' ? (
+                                  <p className="slide-transcript-row-state error">
+                                    {transcriptState.error || 'Transcript generation ended with errors.'}
+                                  </p>
+                                ) : (
+                                  <p className="slide-transcript-row-state">
+                                    Transcript is being prepared for this slide.
+                                  </p>
+                                )}
+                              </div>
+                            </section>
+                          ) : null}
+                          {isNotesOpen ? (
+                            <section
+                              className="slide-note-row"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                              }}
+                            >
+                              <label
+                                className="slide-note-label"
+                                htmlFor={`slide-note-${slide.index}`}
+                              >
+                                Your note for Slide {slide.index + 1}
+                              </label>
+                              <textarea
+                                id={`slide-note-${slide.index}`}
+                                className="slide-note-editor"
+                                value={notesBySlide[slide.index] || ''}
+                                onChange={(event) =>
+                                  handleSlideNoteChange(slide.index, event.target.value)
+                                }
+                                placeholder="Write your own explanation, memory hook, or exam reminder."
+                                rows={4}
+                              />
+                            </section>
+                          ) : null}
+                          <div className="slide-image-wrap">
+                            <button
+                              type="button"
+                              className={`slide-note-btn ${hasNotes ? 'ready' : ''}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleSlideNotes(slide.index);
+                              }}
+                              aria-label={`${isNotesOpen ? 'Hide' : 'Open'} notes for Slide ${slide.index + 1}`}
+                            >
+                              {isNotesOpen ? 'Close Note' : hasNotes ? 'Notes' : 'Add Note'}
+                            </button>
+                            <button
+                              type="button"
+                              className={`slide-transcript-btn ${hasTranscript ? 'ready' : ''}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openTranscriptModal(slide.index);
+                              }}
+                              aria-label={`${isTranscriptOpen ? 'Hide' : 'Open'} transcript for Slide ${slide.index + 1}`}
+                            >
+                              {transcriptButtonLabel}
+                            </button>
+                            <img
+                              src={slideImageUrl(slide.index)}
+                              alt={`Slide ${slide.index + 1}`}
+                              loading="lazy"
+                            />
+                          </div>
+                        </article>
+                      );
+                    })
+                  ) : (
+                    <div className="empty-state">
+                      <p className="dropzone-title">No starred slides yet</p>
+                      <p className="dropzone-subtitle">Star slides to build a focused review list.</p>
+                    </div>
+                  )
                 ) : (
                   <div
                     className={`empty-state upload-dropzone ${isDragActive ? 'drag-over' : ''}`}
@@ -2522,6 +3170,7 @@ function App() {
                 {slides.length ? (
                   <p>
                     Slide {currentSlideIndex + 1} of {slides.length}
+                    {showBookmarkedOnly ? ` · Showing ${slidesToRender.length} starred slides` : ''}
                   </p>
                 ) : (
                   <p>No slides</p>
@@ -2630,6 +3279,7 @@ function App() {
                     </button>
                     <div className="queued-message-actions">
                       {!sending &&
+                      !clearingChat &&
                       index === 0 &&
                       editingQueuedMessageId !== queuedMessage.id ? (
                         <button

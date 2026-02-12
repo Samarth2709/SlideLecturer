@@ -24,6 +24,7 @@ Environment variables (project root `.env` or shell):
 ANTHROPIC_API_KEY=your_key_here
 # Optional
 ANTHROPIC_MODEL=claude-sonnet-4-20250514
+ANTHROPIC_TRANSCRIPT_MODEL=claude-haiku-4-5-20251001
 MAX_PDF_PAGES=100
 CORS_ORIGINS=http://localhost:5173
 ```
@@ -43,6 +44,7 @@ Frontend runs on `http://localhost:5173` and proxies `/api/*` to `http://localho
 - `GET /api/v1/decks/{deck_id}/slides`
 - `GET /api/v1/decks/{deck_id}/slides/{slide_index}/image`
 - `GET /api/v1/decks/{deck_id}/slides/{slide_index}/text`
+- `GET /api/v1/decks/{deck_id}/transcripts` (auto-generated after upload)
 - `POST /api/v1/decks/{deck_id}/chat/stream` (SSE)
 - `POST /api/v1/decks/{deck_id}/chat/clear`
 - `DELETE /api/v1/decks/{deck_id}`

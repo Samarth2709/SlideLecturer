@@ -15,6 +15,7 @@ from .models import (
     ClearChatResponse,
     DeckInfoResponse,
     DeckSlidesResponse,
+    DeckTranscriptsResponse,
     DeckUploadResponse,
     DeleteDeckResponse,
     SlideSummary,
@@ -54,6 +55,8 @@ def upload_deck(file: UploadFile = File(...)) -> DeckUploadResponse:
         record = deck_service.create_deck(file.filename, file.file)
     except DeckValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    ai_service.start_transcript_generation(record.deck_id, target_words=175)
 
     return DeckUploadResponse(
         deck_id=record.deck_id,
@@ -103,6 +106,16 @@ def get_slide_text(deck_id: str, slide_index: int) -> dict:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     return {"deck_id": deck_id, "slide_index": slide_index, "text": text}
+
+
+@app.get("/api/v1/decks/{deck_id}/transcripts", response_model=DeckTranscriptsResponse)
+def get_deck_transcripts(deck_id: str) -> DeckTranscriptsResponse:
+    try:
+        snapshot = deck_service.get_transcript_snapshot(deck_id)
+    except DeckNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Deck not found") from exc
+
+    return DeckTranscriptsResponse(**snapshot)
 
 
 @app.get("/api/v1/decks/{deck_id}/slides/{slide_index}/image")

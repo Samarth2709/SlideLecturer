@@ -48,6 +48,7 @@ class Settings:
     storage_dir: Path
     max_pdf_pages: int
     model_name: str
+    transcript_model_name: str
     cors_origins: list[str]
 
 
@@ -74,6 +75,7 @@ def get_settings() -> Settings:
         storage_dir=storage_dir,
         max_pdf_pages=int(os.getenv("MAX_PDF_PAGES", "100")),
         model_name=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+        transcript_model_name=os.getenv("ANTHROPIC_TRANSCRIPT_MODEL", "claude-haiku-4-5-20251001"),
         cors_origins=_parse_origins(os.getenv("CORS_ORIGINS")),
     )
 

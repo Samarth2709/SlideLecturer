@@ -10,7 +10,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 from uuid import uuid4
 
 import fitz
@@ -37,6 +37,11 @@ class DeckRecord:
     pdf_path: Path
     slide_count: int
     slide_text: list[str]
+    transcript_status: Literal["queued", "generating", "completed", "error"] = "queued"
+    transcript_error: str | None = None
+    transcript_active_slide_index: int | None = None
+    transcripts: list[str | None] = field(default_factory=list)
+    transcript_slide_errors: list[str | None] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     conversation_history: list[dict] = field(default_factory=list)
     is_first_message: bool = True
@@ -88,6 +93,8 @@ class DeckService:
                 pdf_path=pdf_path,
                 slide_count=len(slide_text),
                 slide_text=slide_text,
+                transcripts=[None] * len(slide_text),
+                transcript_slide_errors=[None] * len(slide_text),
             )
 
             with self._lock:
@@ -125,6 +132,112 @@ class DeckService:
         if slide_index < 0 or slide_index >= deck.slide_count:
             raise IndexError(f"Slide index out of range: {slide_index}")
         return deck.slide_text[slide_index]
+
+    def mark_transcript_generation_started(self, deck_id: str) -> bool:
+        deck = self.get_deck(deck_id)
+        with deck.lock:
+            if deck.transcript_status == "generating":
+                return False
+
+            if deck.slide_count == 0:
+                deck.transcript_status = "completed"
+                deck.transcript_error = None
+                deck.transcript_active_slide_index = None
+                return False
+
+            deck.transcript_status = "generating"
+            deck.transcript_error = None
+            deck.transcript_active_slide_index = None
+            deck.transcripts = [None] * deck.slide_count
+            deck.transcript_slide_errors = [None] * deck.slide_count
+        return True
+
+    def mark_transcript_slide_started(self, deck_id: str, slide_index: int) -> None:
+        deck = self.get_deck(deck_id)
+        if slide_index < 0 or slide_index >= deck.slide_count:
+            raise IndexError(f"Slide index out of range: {slide_index}")
+
+        with deck.lock:
+            deck.transcript_active_slide_index = slide_index
+            if deck.transcript_status != "generating":
+                deck.transcript_status = "generating"
+            deck.transcript_error = None
+
+    def mark_transcript_slide_completed(self, deck_id: str, slide_index: int, transcript: str) -> None:
+        deck = self.get_deck(deck_id)
+        if slide_index < 0 or slide_index >= deck.slide_count:
+            raise IndexError(f"Slide index out of range: {slide_index}")
+
+        with deck.lock:
+            deck.transcripts[slide_index] = transcript
+            deck.transcript_slide_errors[slide_index] = None
+            if deck.transcript_active_slide_index == slide_index:
+                deck.transcript_active_slide_index = None
+
+    def mark_transcript_slide_error(self, deck_id: str, slide_index: int, error: str) -> None:
+        deck = self.get_deck(deck_id)
+        if slide_index < 0 or slide_index >= deck.slide_count:
+            raise IndexError(f"Slide index out of range: {slide_index}")
+
+        with deck.lock:
+            deck.transcript_slide_errors[slide_index] = error
+            if deck.transcript_active_slide_index == slide_index:
+                deck.transcript_active_slide_index = None
+
+    def mark_transcript_generation_completed(self, deck_id: str) -> None:
+        deck = self.get_deck(deck_id)
+        with deck.lock:
+            deck.transcript_status = "completed"
+            deck.transcript_error = None
+            deck.transcript_active_slide_index = None
+
+    def mark_transcript_generation_error(self, deck_id: str, error: str) -> None:
+        deck = self.get_deck(deck_id)
+        with deck.lock:
+            deck.transcript_status = "error"
+            deck.transcript_error = error
+            deck.transcript_active_slide_index = None
+
+    def get_transcript_snapshot(self, deck_id: str) -> dict:
+        deck = self.get_deck(deck_id)
+        with deck.lock:
+            completed_slides = sum(1 for transcript in deck.transcripts if transcript is not None)
+            generation_status = deck.transcript_status
+            active_slide_index = deck.transcript_active_slide_index
+            generation_error = deck.transcript_error
+            transcripts = list(deck.transcripts)
+            slide_errors = list(deck.transcript_slide_errors)
+
+        slides = []
+        for index in range(deck.slide_count):
+            transcript = transcripts[index]
+            slide_error = slide_errors[index]
+            if transcript is not None:
+                status = "completed"
+            elif slide_error:
+                status = "error"
+            elif generation_status == "generating" and active_slide_index == index:
+                status = "generating"
+            else:
+                status = "pending"
+
+            slides.append(
+                {
+                    "index": index,
+                    "status": status,
+                    "transcript": transcript,
+                    "error": slide_error,
+                }
+            )
+
+        return {
+            "deck_id": deck.deck_id,
+            "status": generation_status,
+            "total_slides": deck.slide_count,
+            "completed_slides": completed_slides,
+            "error": generation_error,
+            "slides": slides,
+        }
 
     def render_slide_png(self, deck_id: str, slide_index: int, scale: float = 2.0) -> bytes:
         deck = self.get_deck(deck_id)

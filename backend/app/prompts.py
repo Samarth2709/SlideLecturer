@@ -16,6 +16,7 @@ def _load_prompt(filename: str) -> str:
 SYSTEM_PROMPT = _load_prompt("system_prompt.txt")
 USER_PROMPT_TEMPLATE = _load_prompt("user_prompt.txt")
 FOCUS_PROMPT_TEMPLATE = _load_prompt("focus_prompt.txt")
+TRANSCRIPT_PROMPT_TEMPLATE = _load_prompt("transcript_prompt.txt")
 
 
 
@@ -26,3 +27,22 @@ def build_user_prompt(question: str) -> str:
 
 def build_focus_prompt(question: str, slide_number: int) -> str:
     return FOCUS_PROMPT_TEMPLATE.format(question=question, slide_number=slide_number)
+
+
+def _escape_braces(value: str) -> str:
+    return value.replace("{", "{{").replace("}", "}}")
+
+
+def build_transcript_prompt(
+    slide_number: int,
+    total_slides: int,
+    target_words: int,
+    slide_text: str,
+) -> str:
+    normalized_slide_text = slide_text.strip() if slide_text else "(No extractable text found on this slide.)"
+    return TRANSCRIPT_PROMPT_TEMPLATE.format(
+        slide_number=slide_number,
+        total_slides=total_slides,
+        target_words=target_words,
+        slide_text=_escape_braces(normalized_slide_text),
+    )

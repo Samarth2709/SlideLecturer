@@ -33,6 +33,26 @@ class DeckInfoResponse(BaseModel):
     created_at: datetime
 
 
+TranscriptGenerationStatus = Literal["queued", "generating", "completed", "error"]
+TranscriptSlideStatus = Literal["pending", "generating", "completed", "error"]
+
+
+class SlideTranscript(BaseModel):
+    index: int
+    status: TranscriptSlideStatus
+    transcript: str | None = None
+    error: str | None = None
+
+
+class DeckTranscriptsResponse(BaseModel):
+    deck_id: str
+    status: TranscriptGenerationStatus
+    total_slides: int
+    completed_slides: int
+    error: str | None = None
+    slides: list[SlideTranscript]
+
+
 class ChatHistoryTurn(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=50000)

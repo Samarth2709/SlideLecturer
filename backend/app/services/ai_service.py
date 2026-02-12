@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import base64
+import threading
 from typing import Generator
 
 from anthropic import Anthropic
 
 from ..config import settings
-from ..prompts import SYSTEM_PROMPT, build_focus_prompt, build_user_prompt
-from .deck_service import DeckRecord, DeckService
+from ..prompts import SYSTEM_PROMPT, build_focus_prompt, build_transcript_prompt, build_user_prompt
+from .deck_service import DeckNotFoundError, DeckRecord, DeckService
+
+TRANSCRIPT_SYSTEM_PROMPT = (
+    "You are an expert university professor. Generate spoken lecture transcripts for slides. "
+    "Always return plain text with no markdown."
+)
 
 
 class AIService:
@@ -22,6 +28,23 @@ class AIService:
     @property
     def is_available(self) -> bool:
         return self.client is not None
+
+    def start_transcript_generation(self, deck_id: str, target_words: int = 175) -> None:
+        try:
+            should_start = self.deck_service.mark_transcript_generation_started(deck_id)
+        except DeckNotFoundError:
+            return
+
+        if not should_start:
+            return
+
+        worker = threading.Thread(
+            target=self._generate_transcripts_worker,
+            args=(deck_id, target_words),
+            daemon=True,
+            name=f"transcript-worker-{deck_id[:8]}",
+        )
+        worker.start()
 
     def stream_answer(
         self,
@@ -91,6 +114,135 @@ class AIService:
                 deck.conversation_history.append({"role": "user", "content": prompt_text})
                 deck.conversation_history.append({"role": "assistant", "content": full_response})
                 deck.is_first_message = False
+
+    def _generate_transcripts_worker(self, deck_id: str, target_words: int) -> None:
+        try:
+            deck = self.deck_service.get_deck(deck_id)
+        except DeckNotFoundError:
+            return
+
+        if not self.is_available:
+            try:
+                self.deck_service.mark_transcript_generation_error(
+                    deck_id,
+                    "AI service not available. Set ANTHROPIC_API_KEY.",
+                )
+            except DeckNotFoundError:
+                return
+            return
+
+        if deck.slide_count > settings.max_pdf_pages:
+            try:
+                self.deck_service.mark_transcript_generation_error(
+                    deck_id,
+                    (
+                        f"Deck has {deck.slide_count} pages, which exceeds the configured limit of "
+                        f"{settings.max_pdf_pages} pages."
+                    ),
+                )
+            except DeckNotFoundError:
+                return
+            return
+
+        try:
+            pdf_base64 = deck.get_pdf_base64()
+        except FileNotFoundError:
+            try:
+                self.deck_service.mark_transcript_generation_error(
+                    deck_id,
+                    "Deck files are no longer available for transcript generation.",
+                )
+            except DeckNotFoundError:
+                return
+            return
+
+        slide_errors: list[str] = []
+
+        for slide_index in range(deck.slide_count):
+            try:
+                self.deck_service.mark_transcript_slide_started(deck_id, slide_index)
+                transcript = self._generate_slide_transcript(
+                    deck=deck,
+                    slide_index=slide_index,
+                    target_words=target_words,
+                    pdf_base64=pdf_base64,
+                )
+                self.deck_service.mark_transcript_slide_completed(deck_id, slide_index, transcript)
+            except DeckNotFoundError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                error_text = str(exc).strip() or "Unknown transcript generation error"
+                try:
+                    self.deck_service.mark_transcript_slide_error(deck_id, slide_index, error_text)
+                except DeckNotFoundError:
+                    return
+                slide_errors.append(f"Slide {slide_index + 1}: {error_text}")
+
+        try:
+            if slide_errors:
+                summary = "; ".join(slide_errors[:3])
+                if len(slide_errors) > 3:
+                    summary += f"; ... ({len(slide_errors) - 3} additional slide errors)"
+                self.deck_service.mark_transcript_generation_error(
+                    deck_id,
+                    f"Transcript generation completed with errors. {summary}",
+                )
+            else:
+                self.deck_service.mark_transcript_generation_completed(deck_id)
+        except DeckNotFoundError:
+            return
+
+    def _generate_slide_transcript(
+        self,
+        deck: DeckRecord,
+        slide_index: int,
+        target_words: int,
+        pdf_base64: str,
+    ) -> str:
+        if not self.client:
+            raise RuntimeError("AI service not available.")
+
+        slide_text = self.deck_service.get_slide_text(deck.deck_id, slide_index)
+        slide_text = slide_text[:8000]
+
+        prompt_text = build_transcript_prompt(
+            slide_number=slide_index + 1,
+            total_slides=deck.slide_count,
+            target_words=target_words,
+            slide_text=slide_text,
+        )
+
+        user_content = [
+            self._build_pdf_document_block(pdf_base64, with_cache=True),
+            self._build_text_block(prompt_text),
+        ]
+
+        response = self.client.messages.create(
+            model=settings.transcript_model_name,
+            max_tokens=900,
+            system=TRANSCRIPT_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
+
+        transcript = self._extract_response_text(response)
+        normalized_transcript = " ".join(transcript.split())
+        if not normalized_transcript:
+            raise RuntimeError("Model returned an empty transcript.")
+        return normalized_transcript
+
+    @staticmethod
+    def _extract_response_text(response) -> str:
+        text_chunks: list[str] = []
+        for block in getattr(response, "content", []):
+            text_value = getattr(block, "text", None)
+            if text_value:
+                text_chunks.append(text_value)
+                continue
+
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                text_chunks.append(str(block["text"]))
+
+        return "".join(text_chunks).strip()
 
     @staticmethod
     def _build_pdf_document_block(pdf_base64: str, with_cache: bool = False) -> dict:

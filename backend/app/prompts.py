@@ -29,10 +29,6 @@ def build_focus_prompt(question: str, slide_number: int) -> str:
     return FOCUS_PROMPT_TEMPLATE.format(question=question, slide_number=slide_number)
 
 
-def _escape_braces(value: str) -> str:
-    return value.replace("{", "{{").replace("}", "}}")
-
-
 def build_transcript_prompt(
     slide_number: int,
     total_slides: int,
@@ -44,5 +40,5 @@ def build_transcript_prompt(
         slide_number=slide_number,
         total_slides=total_slides,
         target_words=target_words,
-        slide_text=_escape_braces(normalized_slide_text),
+        slide_text=normalized_slide_text,
     )

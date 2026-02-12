@@ -74,36 +74,10 @@ function sanitizeStoredBookmarkedSlides(value, totalSlides) {
   return Array.from(seen).sort((first, second) => first - second);
 }
 
-function sanitizeStoredNotesBySlide(value, totalSlides) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return {};
-  }
-
-  const upperBound = Number.isInteger(totalSlides) ? totalSlides - 1 : -1;
-  const normalized = {};
-
-  for (const [rawIndex, rawNote] of Object.entries(value)) {
-    const index = Number(rawIndex);
-    if (!Number.isInteger(index) || index < 0 || index > upperBound) {
-      continue;
-    }
-
-    const note = String(rawNote || '');
-    if (!note.trim()) {
-      continue;
-    }
-
-    normalized[index] = note;
-  }
-
-  return normalized;
-}
-
 function loadDeckPreferences(storageKey, totalSlides) {
   if (typeof window === 'undefined' || !storageKey) {
     return {
       bookmarks: [],
-      notesBySlide: {},
     };
   }
 
@@ -112,20 +86,17 @@ function loadDeckPreferences(storageKey, totalSlides) {
     if (!raw) {
       return {
         bookmarks: [],
-        notesBySlide: {},
       };
     }
 
     const parsed = JSON.parse(raw);
     return {
       bookmarks: sanitizeStoredBookmarkedSlides(parsed?.bookmarks, totalSlides),
-      notesBySlide: sanitizeStoredNotesBySlide(parsed?.notesBySlide, totalSlides),
     };
   } catch (error) {
     console.warn('Failed to load deck preferences from local storage', error);
     return {
       bookmarks: [],
-      notesBySlide: {},
     };
   }
 }
@@ -138,7 +109,6 @@ function persistDeckPreferences(storageKey, totalSlides, payload) {
   try {
     const normalizedPayload = {
       bookmarks: sanitizeStoredBookmarkedSlides(payload?.bookmarks, totalSlides),
-      notesBySlide: sanitizeStoredNotesBySlide(payload?.notesBySlide, totalSlides),
     };
     window.localStorage.setItem(storageKey, JSON.stringify(normalizedPayload));
   } catch (error) {
@@ -783,10 +753,8 @@ function App() {
   const [slidesVisible, setSlidesVisible] = useState(true);
   const [transcriptState, setTranscriptState] = useState(() => buildEmptyTranscriptState());
   const [activeTranscriptSlideIndex, setActiveTranscriptSlideIndex] = useState(null);
-  const [activeNotesSlideIndex, setActiveNotesSlideIndex] = useState(null);
   const [bookmarkedSlideIndices, setBookmarkedSlideIndices] = useState([]);
   const [showBookmarkedOnly, setShowBookmarkedOnly] = useState(false);
-  const [notesBySlide, setNotesBySlide] = useState({});
   const [slideSearchQuery, setSlideSearchQuery] = useState('');
   const [splitRatio, setSplitRatio] = useState(() => loadInitialSplitRatio());
   const [isResizingSplit, setIsResizingSplit] = useState(false);
@@ -1556,25 +1524,15 @@ function App() {
     for (const slide of slides) {
       const slideIndex = slide.index;
       const transcriptEntry = transcriptsBySlide.get(slideIndex);
-      const note = String(notesBySlide[slideIndex] || '');
       const transcript = String(transcriptEntry?.transcript || '');
       const preview = String(slide.text_preview || '');
 
-      const normalizedNote = note.toLowerCase();
       const normalizedTranscript = transcript.toLowerCase();
       const normalizedPreview = preview.toLowerCase();
 
       let score = 0;
       let snippet = '';
       let matchedSource = '';
-
-      if (normalizedNote.includes(normalizedSlideSearchQuery)) {
-        score += 5;
-        if (!snippet) {
-          snippet = buildSearchSnippet(note, normalizedSlideSearchQuery);
-          matchedSource = 'Notes';
-        }
-      }
 
       if (normalizedTranscript.includes(normalizedSlideSearchQuery)) {
         score += 4;
@@ -1617,25 +1575,21 @@ function App() {
     });
 
     return results.slice(0, 30);
-  }, [bookmarkedSlideSet, normalizedSlideSearchQuery, notesBySlide, slides, transcriptsBySlide]);
+  }, [bookmarkedSlideSet, normalizedSlideSearchQuery, slides, transcriptsBySlide]);
 
   useEffect(() => {
     const totalSlides = Number(deck?.slide_count || 0);
     if (!deckPreferenceStorageKey || !totalSlides) {
       setBookmarkedSlideIndices([]);
       setShowBookmarkedOnly(false);
-      setNotesBySlide({});
       setSlideSearchQuery('');
-      setActiveNotesSlideIndex(null);
       return;
     }
 
     const loaded = loadDeckPreferences(deckPreferenceStorageKey, totalSlides);
     setBookmarkedSlideIndices(loaded.bookmarks);
-    setNotesBySlide(loaded.notesBySlide);
     setShowBookmarkedOnly(false);
     setSlideSearchQuery('');
-    setActiveNotesSlideIndex(null);
   }, [deck?.slide_count, deckPreferenceStorageKey]);
 
   useEffect(() => {
@@ -1646,9 +1600,8 @@ function App() {
 
     persistDeckPreferences(deckPreferenceStorageKey, totalSlides, {
       bookmarks: bookmarkedSlideIndices,
-      notesBySlide,
     });
-  }, [bookmarkedSlideIndices, deck?.slide_count, deckPreferenceStorageKey, notesBySlide]);
+  }, [bookmarkedSlideIndices, deck?.slide_count, deckPreferenceStorageKey]);
 
   useEffect(() => {
     if (!showBookmarkedOnly) {
@@ -1681,8 +1634,7 @@ function App() {
   }, [showBookmarkedOnly, slidesToRender]);
 
   useEffect(() => {
-    const hasOverlay = activeTranscriptSlideIndex !== null || activeNotesSlideIndex !== null;
-    if (!hasOverlay) {
+    if (activeTranscriptSlideIndex === null) {
       return;
     }
 
@@ -1692,17 +1644,12 @@ function App() {
       }
 
       event.preventDefault();
-      if (activeNotesSlideIndex !== null) {
-        setActiveNotesSlideIndex(null);
-        return;
-      }
-
       setActiveTranscriptSlideIndex(null);
     };
 
     window.addEventListener('keydown', handleEscape);
     return () => window.removeEventListener('keydown', handleEscape);
-  }, [activeNotesSlideIndex, activeTranscriptSlideIndex]);
+  }, [activeTranscriptSlideIndex]);
 
   const clampSplitRatio = useCallback((ratio, containerWidth = 0) => {
     const safeRatio = Number.isFinite(ratio) ? ratio : DEFAULT_SPLIT_RATIO;
@@ -1983,34 +1930,6 @@ function App() {
     });
   }
 
-  function toggleSlideNotes(slideIndex) {
-    setActiveNotesSlideIndex((previous) => (previous === slideIndex ? null : slideIndex));
-  }
-
-  function handleSlideNoteChange(slideIndex, noteValue) {
-    const nextNote = String(noteValue || '');
-    setNotesBySlide((previous) => {
-      const hasExisting = Object.prototype.hasOwnProperty.call(previous, slideIndex);
-      if (!nextNote.trim()) {
-        if (!hasExisting) {
-          return previous;
-        }
-        const nextState = { ...previous };
-        delete nextState[slideIndex];
-        return nextState;
-      }
-
-      if (hasExisting && previous[slideIndex] === nextNote) {
-        return previous;
-      }
-
-      return {
-        ...previous,
-        [slideIndex]: nextNote,
-      };
-    });
-  }
-
   function jumpToSearchResult(slideIndex) {
     if (!Number.isInteger(slideIndex) || slideIndex < 0) {
       return;
@@ -2231,16 +2150,6 @@ function App() {
     }
     setActiveTranscriptSlideIndex(null);
   }, [activeTranscriptSlideIndex, slides.length]);
-
-  useEffect(() => {
-    if (activeNotesSlideIndex === null) {
-      return;
-    }
-    if (activeNotesSlideIndex < slides.length) {
-      return;
-    }
-    setActiveNotesSlideIndex(null);
-  }, [activeNotesSlideIndex, slides.length]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -2937,9 +2846,9 @@ function App() {
                       }
                     }}
                     className="slides-search-input"
-                    placeholder="Search slides, transcripts, notes (/)"
+                    placeholder="Search slides and transcripts (/)"
                     disabled={!slides.length}
-                    aria-label="Search slides, transcripts, and notes"
+                    aria-label="Search slides and transcripts"
                   />
                   {slideSearchQuery.trim() ? (
                     <button

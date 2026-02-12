@@ -20,6 +20,48 @@ const SPLIT_MIN_RATIO = 0.2;
 const SPLIT_MAX_RATIO = 0.8;
 const SPLIT_MIN_PANEL_PX = 320;
 const SPLITTER_WIDTH_PX = 12;
+const TRANSCRIPT_POLL_INTERVAL_MS = 1800;
+
+const EMPTY_TRANSCRIPT_STATE = Object.freeze({
+  status: 'queued',
+  total_slides: 0,
+  completed_slides: 0,
+  error: null,
+  slides: [],
+});
+
+function buildEmptyTranscriptState(totalSlides = 0) {
+  return {
+    ...EMPTY_TRANSCRIPT_STATE,
+    total_slides: totalSlides,
+  };
+}
+
+function describeTranscriptGeneration(state) {
+  const totalSlides = Number(state?.total_slides || 0);
+  const completedSlides = Number(state?.completed_slides || 0);
+  const generationStatus = state?.status || 'queued';
+
+  if (!totalSlides) {
+    return '';
+  }
+
+  if (generationStatus === 'completed') {
+    return `Transcripts ready: ${completedSlides}/${totalSlides}`;
+  }
+
+  if (generationStatus === 'error') {
+    return state?.error
+      ? `Transcripts incomplete: ${completedSlides}/${totalSlides}`
+      : `Transcript generation failed (${completedSlides}/${totalSlides})`;
+  }
+
+  if (generationStatus === 'generating') {
+    return `Generating transcripts: ${completedSlides}/${totalSlides}`;
+  }
+
+  return `Preparing transcripts: ${completedSlides}/${totalSlides}`;
+}
 
 function loadInitialSplitRatio() {
   if (typeof window === 'undefined') {
@@ -541,7 +583,7 @@ function App() {
   const [branchesById, setBranchesById] = useState(() => ({
     [MAIN_BRANCH_ID]: {
       id: MAIN_BRANCH_ID,
-      label: 'Main',
+      label: 'Branch 1',
       parentBranchId: null,
       parentMessageId: null,
       messages: [WELCOME_MESSAGE],
@@ -550,9 +592,16 @@ function App() {
   const [branchOrder, setBranchOrder] = useState([MAIN_BRANCH_ID]);
   const [activeBranchId, setActiveBranchId] = useState(MAIN_BRANCH_ID);
   const [inputValue, setInputValue] = useState('');
+  const [queuedMessagesByBranch, setQueuedMessagesByBranch] = useState(() => ({
+    [MAIN_BRANCH_ID]: [],
+  }));
+  const [editingQueuedMessageId, setEditingQueuedMessageId] = useState(null);
+  const [queueDraftSnapshot, setQueueDraftSnapshot] = useState('');
   const [uploading, setUploading] = useState(false);
   const [sending, setSending] = useState(false);
+  const [streamingBranchId, setStreamingBranchId] = useState(null);
   const [clearingChat, setClearingChat] = useState(false);
+  const [isBranchMapOpen, setIsBranchMapOpen] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState(null);
   const [messageDraft, setMessageDraft] = useState('');
   const [copiedMessageId, setCopiedMessageId] = useState(null);
@@ -560,6 +609,8 @@ function App() {
   const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
   const [focusedSlideIndex, setFocusedSlideIndex] = useState(null);
   const [slidesVisible, setSlidesVisible] = useState(true);
+  const [transcriptState, setTranscriptState] = useState(() => buildEmptyTranscriptState());
+  const [activeTranscriptSlideIndex, setActiveTranscriptSlideIndex] = useState(null);
   const [splitRatio, setSplitRatio] = useState(() => loadInitialSplitRatio());
   const [isResizingSplit, setIsResizingSplit] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
@@ -574,25 +625,572 @@ function App() {
   const dragDepthRef = useRef(0);
   const copyResetTimerRef = useRef(null);
   const branchCounterRef = useRef(1);
+  const branchesRef = useRef(branchesById);
+  const queuedMessagesByBranchRef = useRef(queuedMessagesByBranch);
+  const editingQueuedMessageIdRef = useRef(editingQueuedMessageId);
+  const activeBranchIdRef = useRef(activeBranchId);
+  const sendingRef = useRef(sending);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
   const messages = activeBranch?.messages || [WELCOME_MESSAGE];
   const activeBranchIndex = Math.max(0, branchOrder.indexOf(activeBranchId));
+  const queuedMessages = queuedMessagesByBranch[activeBranchId] || [];
+  const queueEditingIndex = queuedMessages.findIndex(
+    (queuedMessage) => queuedMessage.id === editingQueuedMessageId
+  );
+
+  const branchTree = useMemo(() => {
+    const nonWelcomeMessagesFor = (branch) =>
+      branch.messages.filter((message) => message.id !== WELCOME_MESSAGE.id);
+
+    const assistantMessagesFor = (branch) =>
+      nonWelcomeMessagesFor(branch).filter((message) => message.role === 'assistant');
+
+    const normalizeSnippet = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+
+    const tailSnippet = (text, maxChars = 56) => {
+      const normalized = normalizeSnippet(text);
+      if (!normalized) {
+        return 'No user prompt captured';
+      }
+      if (normalized.length <= maxChars) {
+        return normalized;
+      }
+
+      return `...${normalized.slice(-maxChars)}`;
+    };
+
+    const findTurnForMessageId = (messageId) => {
+      if (!messageId) {
+        return null;
+      }
+
+      for (const branchId of branchOrder) {
+        const branch = branchesById[branchId];
+        if (!branch) {
+          continue;
+        }
+
+        const nonWelcomeMessages = nonWelcomeMessagesFor(branch);
+        const messageIndex = nonWelcomeMessages.findIndex((message) => message.id === messageId);
+        if (messageIndex !== -1) {
+          return Math.ceil((messageIndex + 1) / 2);
+        }
+      }
+
+      return null;
+    };
+
+    const findUserMessageForAssistant = (messageId) => {
+      if (!messageId) {
+        return '';
+      }
+
+      for (const branchId of branchOrder) {
+        const branch = branchesById[branchId];
+        if (!branch) {
+          continue;
+        }
+
+        const nonWelcomeMessages = nonWelcomeMessagesFor(branch);
+        const assistantIndex = nonWelcomeMessages.findIndex(
+          (message) => message.id === messageId && message.role === 'assistant'
+        );
+        if (assistantIndex < 0) {
+          continue;
+        }
+
+        for (let cursor = assistantIndex - 1; cursor >= 0; cursor -= 1) {
+          const candidate = nonWelcomeMessages[cursor];
+          if (candidate.role === 'user') {
+            return candidate.content;
+          }
+        }
+      }
+
+      return '';
+    };
+
+    const promptPreviewCache = new Map();
+    const getPromptPreview = (messageId) => {
+      if (!messageId) {
+        return 'No user prompt captured';
+      }
+
+      if (promptPreviewCache.has(messageId)) {
+        return promptPreviewCache.get(messageId);
+      }
+
+      const preview = tailSnippet(findUserMessageForAssistant(messageId));
+      promptPreviewCache.set(messageId, preview);
+      return preview;
+    };
+
+    const branchOrderIndex = new Map(branchOrder.map((branchId, index) => [branchId, index]));
+    const branchSummaries = new Map();
+    const branchesAtContext = new Map();
+    const contextIdOrder = [];
+    const seenContextIds = new Set();
+    const topContextIds = [];
+    const seenTopContexts = new Set();
+    const rootBranchIds = [];
+
+    const ensureContextOrder = (contextId) => {
+      if (!contextId || seenContextIds.has(contextId)) {
+        return;
+      }
+      seenContextIds.add(contextId);
+      contextIdOrder.push(contextId);
+    };
+
+    for (const branchId of branchOrder) {
+      const branch = branchesById[branchId];
+      if (!branch) {
+        continue;
+      }
+
+      const nonWelcomeMessages = nonWelcomeMessagesFor(branch);
+      const assistantMessages = assistantMessagesFor(branch);
+      const turnCount = Math.ceil(nonWelcomeMessages.length / 2);
+
+      let derivedFrom = 'initial conversation context';
+      if (branch.parentMessageId) {
+        derivedFrom = `context "${getPromptPreview(branch.parentMessageId)}"`;
+      }
+
+      branchSummaries.set(branchId, {
+        id: branch.id,
+        label: branch.label,
+        turnCount,
+        messageCount: nonWelcomeMessages.length,
+        isActive: branch.id === activeBranchId,
+        derivedFrom,
+      });
+
+      if (!assistantMessages.length) {
+        rootBranchIds.push(branchId);
+        continue;
+      }
+
+      const firstContextId = assistantMessages[0].id;
+      if (!seenTopContexts.has(firstContextId)) {
+        seenTopContexts.add(firstContextId);
+        topContextIds.push(firstContextId);
+      }
+
+      for (let index = 0; index < assistantMessages.length; index += 1) {
+        const contextId = assistantMessages[index].id;
+        const nextContextId = assistantMessages[index + 1]?.id || null;
+
+        ensureContextOrder(contextId);
+        if (nextContextId) {
+          ensureContextOrder(nextContextId);
+        }
+
+        if (!branchesAtContext.has(contextId)) {
+          branchesAtContext.set(contextId, []);
+        }
+
+        branchesAtContext.get(contextId).push({
+          branchId,
+          contextId,
+          nextContextId,
+        });
+      }
+    }
+
+    const contextLabelById = new Map();
+    contextIdOrder.forEach((contextId, index) => {
+      contextLabelById.set(contextId, `Context Node ${index + 1}`);
+    });
+
+    const sortContextRefs = (refs) =>
+      [...refs].sort((firstRef, secondRef) => {
+        const firstIndex = branchOrderIndex.get(firstRef.branchId) ?? Number.MAX_SAFE_INTEGER;
+        const secondIndex = branchOrderIndex.get(secondRef.branchId) ?? Number.MAX_SAFE_INTEGER;
+        if (firstIndex !== secondIndex) {
+          return firstIndex - secondIndex;
+        }
+
+        return firstRef.branchId.localeCompare(secondRef.branchId);
+      });
+
+    const buildContextNode = (contextId, ancestry = new Set()) => {
+      if (!contextId) {
+        return null;
+      }
+
+      const ancestryKey = `context:${contextId}`;
+      if (ancestry.has(ancestryKey)) {
+        return null;
+      }
+
+      const nextAncestry = new Set(ancestry);
+      nextAncestry.add(ancestryKey);
+
+      const contextTurn = findTurnForMessageId(contextId);
+      const branchRefs = sortContextRefs(branchesAtContext.get(contextId) || []);
+      const preferredSourceRef =
+        branchRefs.find((reference) => reference.branchId === activeBranchId) || branchRefs[0] || null;
+      const sourceBranchId = preferredSourceRef?.branchId || null;
+      const branchNodes = branchRefs
+        .map((reference) => {
+          const summary = branchSummaries.get(reference.branchId);
+          if (!summary) {
+            return null;
+          }
+
+          const childContextNode = reference.nextContextId
+            ? buildContextNode(reference.nextContextId, nextAncestry)
+            : null;
+          const hasChildContext = Boolean(childContextNode);
+          const actionDescription = 'Click to switch to this branch.';
+
+          return {
+            key: `branch:${reference.branchId}:${reference.contextId}`,
+            branchId: summary.id,
+            label: summary.label,
+            turnCount: summary.turnCount,
+            messageCount: summary.messageCount,
+            isActive: summary.isActive,
+            hasChildContext,
+            kindLabel: 'Branch · click to switch',
+            tooltip: `${summary.label} derives from ${summary.derivedFrom}. ${actionDescription}`,
+            childContext: childContextNode,
+          };
+        })
+        .filter(Boolean);
+
+      const contextPreview = getPromptPreview(contextId);
+      const contextSummary = `Prompt: "${contextPreview}"`;
+      const contextAction = sourceBranchId
+        ? 'Click to branch from this context.'
+        : 'No branch action available for this context yet.';
+
+      return {
+        key: `context:${contextId}`,
+        contextId,
+        title: contextLabelById.get(contextId) || 'Context Node',
+        summary: contextSummary,
+        tooltip: `${contextSummary} ${contextAction}`,
+        sourceBranchId,
+        sourceMessageId: contextId,
+        canBranch: Boolean(sourceBranchId),
+        branches: branchNodes,
+      };
+    };
+
+    const rootContextNodes = topContextIds
+      .map((contextId) => buildContextNode(contextId))
+      .filter(Boolean);
+
+    if (rootContextNodes.length) {
+      return {
+        rootContexts: rootContextNodes,
+        hasNodes: true,
+      };
+    }
+
+    const rootBranches = rootBranchIds
+      .map((branchId) => {
+        const summary = branchSummaries.get(branchId);
+        if (!summary) {
+          return null;
+        }
+
+        return {
+          key: `branch:${summary.id}:root`,
+          branchId: summary.id,
+          label: summary.label,
+          turnCount: summary.turnCount,
+          messageCount: summary.messageCount,
+          isActive: summary.isActive,
+          kindLabel: 'Branch · click to switch',
+          tooltip: `${summary.label} derives from ${summary.derivedFrom}. Click to switch to this branch.`,
+          hasChildContext: false,
+          childContext: null,
+        };
+      })
+      .filter(Boolean);
+
+    if (!rootBranches.length) {
+      return {
+        rootContexts: [],
+        hasNodes: false,
+      };
+    }
+
+    return {
+      rootContexts: [
+        {
+          key: 'context:root',
+          contextId: 'root',
+          title: 'Context Node 1',
+          summary: 'Initial conversation context',
+          tooltip: 'Initial conversation context',
+          sourceBranchId: null,
+          sourceMessageId: null,
+          canBranch: false,
+          branches: rootBranches,
+        },
+      ],
+      hasNodes: true,
+    };
+  }, [branchesById, branchOrder, activeBranchId]);
+
+  useEffect(() => {
+    branchesRef.current = branchesById;
+  }, [branchesById]);
+
+  useEffect(() => {
+    queuedMessagesByBranchRef.current = queuedMessagesByBranch;
+  }, [queuedMessagesByBranch]);
+
+  useEffect(() => {
+    editingQueuedMessageIdRef.current = editingQueuedMessageId;
+  }, [editingQueuedMessageId]);
+
+  useEffect(() => {
+    activeBranchIdRef.current = activeBranchId;
+  }, [activeBranchId]);
+
+  useEffect(() => {
+    sendingRef.current = sending;
+  }, [sending]);
 
   const resetBranches = useCallback(() => {
-    setBranchesById({
+    const resetBranchState = {
       [MAIN_BRANCH_ID]: {
         id: MAIN_BRANCH_ID,
-        label: 'Main',
+        label: 'Branch 1',
         parentBranchId: null,
         parentMessageId: null,
         messages: [WELCOME_MESSAGE],
       },
-    });
+    };
+    branchesRef.current = resetBranchState;
+    setBranchesById(resetBranchState);
     setBranchOrder([MAIN_BRANCH_ID]);
     setActiveBranchId(MAIN_BRANCH_ID);
+    const resetQueueState = {
+      [MAIN_BRANCH_ID]: [],
+    };
+    queuedMessagesByBranchRef.current = resetQueueState;
+    setQueuedMessagesByBranch(resetQueueState);
+    editingQueuedMessageIdRef.current = null;
+    setEditingQueuedMessageId(null);
+    setQueueDraftSnapshot('');
+    setStreamingBranchId(null);
+    setIsBranchMapOpen(false);
     branchCounterRef.current = 1;
   }, []);
+
+  const resetTranscriptState = useCallback((totalSlides = 0) => {
+    setTranscriptState(buildEmptyTranscriptState(totalSlides));
+    setActiveTranscriptSlideIndex(null);
+  }, []);
+
+  const updateQueueForBranch = useCallback((branchId, updater) => {
+    if (!branchId) {
+      return [];
+    }
+
+    const previousState = queuedMessagesByBranchRef.current;
+    const previousQueue = previousState[branchId] || [];
+    const computedQueue = typeof updater === 'function' ? updater(previousQueue) : updater;
+    const nextQueue = Array.isArray(computedQueue) ? computedQueue : [];
+    const nextState = {
+      ...previousState,
+      [branchId]: nextQueue,
+    };
+    queuedMessagesByBranchRef.current = nextState;
+    setQueuedMessagesByBranch(nextState);
+    return nextQueue;
+  }, []);
+
+  const enqueueMessageForBranch = useCallback(
+    (branchId, content) => {
+      const trimmedContent = String(content || '').trim();
+      if (!trimmedContent) {
+        return null;
+      }
+
+      const queuedMessage = {
+        id: `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        content: trimmedContent,
+        createdAt: Date.now(),
+      };
+
+      updateQueueForBranch(branchId, (existingQueue) => [...existingQueue, queuedMessage]);
+      return queuedMessage;
+    },
+    [updateQueueForBranch]
+  );
+
+  const removeQueuedMessage = useCallback(
+    (branchId, queuedMessageId) => {
+      if (!branchId || !queuedMessageId) {
+        return;
+      }
+
+      updateQueueForBranch(
+        branchId,
+        (existingQueue) =>
+          existingQueue.filter((queuedMessage) => queuedMessage.id !== queuedMessageId)
+      );
+    },
+    [updateQueueForBranch]
+  );
+
+  const updateQueuedMessage = useCallback(
+    (branchId, queuedMessageId, content) => {
+      if (!branchId || !queuedMessageId) {
+        return;
+      }
+
+      updateQueueForBranch(
+        branchId,
+        (existingQueue) =>
+          existingQueue.map((queuedMessage) =>
+            queuedMessage.id === queuedMessageId
+              ? { ...queuedMessage, content: String(content || '') }
+              : queuedMessage
+          )
+      );
+    },
+    [updateQueueForBranch]
+  );
+
+  const getNextQueuedMessageToSend = useCallback((branchId) => {
+    if (!branchId) {
+      return null;
+    }
+
+    const branchQueue = queuedMessagesByBranchRef.current[branchId] || [];
+    if (!branchQueue.length) {
+      return null;
+    }
+
+    const editingQueuedId = editingQueuedMessageIdRef.current;
+    if (!editingQueuedId) {
+      return branchQueue[0];
+    }
+
+    const editingIndex = branchQueue.findIndex(
+      (queuedMessage) => queuedMessage.id === editingQueuedId
+    );
+    if (editingIndex < 0) {
+      return branchQueue[0];
+    }
+
+    if (editingIndex === 0) {
+      return null;
+    }
+
+    return branchQueue[0];
+  }, []);
+
+  const selectBranch = useCallback(
+    (branchId, options = { closeMap: false }) => {
+      if (!branchesById[branchId]) {
+        return;
+      }
+
+      setActiveBranchId(branchId);
+      setEditingMessageId(null);
+      setMessageDraft('');
+      setCopiedMessageId(null);
+      editingQueuedMessageIdRef.current = null;
+      setEditingQueuedMessageId(null);
+      setQueueDraftSnapshot('');
+
+      if (options.closeMap) {
+        setIsBranchMapOpen(false);
+      }
+    },
+    [branchesById]
+  );
+
+  const createBranchFromSource = useCallback(
+    (sourceBranchId, messageId, options = { closeMap: false }) => {
+      const sourceBranch = branchesById[sourceBranchId];
+      if (!sourceBranch) {
+        return null;
+      }
+
+      const sourceIndex = sourceBranch.messages.findIndex(
+        (message) => message.id === messageId && message.role === 'assistant'
+      );
+      if (sourceIndex < 0) {
+        setError('Unable to branch from this node because no assistant response was found.');
+        return null;
+      }
+
+      const branchId = `branch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      branchCounterRef.current += 1;
+
+      setBranchesById((previous) => {
+        const nextState = {
+          ...previous,
+          [branchId]: {
+            id: branchId,
+            label: `Branch ${branchCounterRef.current}`,
+            parentBranchId: sourceBranchId,
+            parentMessageId: messageId,
+            messages: sourceBranch.messages.slice(0, sourceIndex + 1).map((message) => ({ ...message })),
+          },
+        };
+        branchesRef.current = nextState;
+        return nextState;
+      });
+      updateQueueForBranch(branchId, []);
+      setBranchOrder((previous) => [...previous, branchId]);
+      setActiveBranchId(branchId);
+      setEditingMessageId(null);
+      setMessageDraft('');
+      setCopiedMessageId(null);
+      editingQueuedMessageIdRef.current = null;
+      setEditingQueuedMessageId(null);
+      setQueueDraftSnapshot('');
+      setError('');
+
+      if (options.closeMap) {
+        setIsBranchMapOpen(false);
+      }
+
+      return branchId;
+    },
+    [branchesById, updateQueueForBranch]
+  );
+
+  const createBranchFromAssistant = useCallback(
+    (messageId) => {
+      createBranchFromSource(activeBranchId, messageId);
+    },
+    [activeBranchId, createBranchFromSource]
+  );
+
+  const handleTreeNodeClick = useCallback(
+    (node) => {
+      if (!node) {
+        return;
+      }
+
+      selectBranch(node.branchId, { closeMap: true });
+    },
+    [selectBranch]
+  );
+
+  const handleContextNodeClick = useCallback(
+    (node) => {
+      if (!node || !node.canBranch || !node.sourceBranchId || !node.sourceMessageId) {
+        return;
+      }
+
+      createBranchFromSource(node.sourceBranchId, node.sourceMessageId, { closeMap: true });
+    },
+    [createBranchFromSource]
+  );
 
   const updateBranchMessages = useCallback((branchId, updater) => {
     setBranchesById((previous) => {
@@ -604,13 +1202,15 @@ function App() {
       const nextMessages =
         typeof updater === 'function' ? updater(targetBranch.messages) : updater;
 
-      return {
+      const nextState = {
         ...previous,
         [branchId]: {
           ...targetBranch,
           messages: nextMessages,
         },
       };
+      branchesRef.current = nextState;
+      return nextState;
     });
   }, []);
 
@@ -639,12 +1239,9 @@ function App() {
         return;
       }
 
-      setActiveBranchId(nextBranchId);
-      setEditingMessageId(null);
-      setMessageDraft('');
-      setCopiedMessageId(null);
+      selectBranch(nextBranchId);
     },
-    [activeBranchId, branchOrder]
+    [activeBranchId, branchOrder, selectBranch]
   );
 
   useEffect(() => {
@@ -670,6 +1267,30 @@ function App() {
   }, [messages, editingMessageId]);
 
   useEffect(() => {
+    if (!branchesById[activeBranchId]) {
+      return;
+    }
+
+    if (queuedMessagesByBranchRef.current[activeBranchId]) {
+      return;
+    }
+
+    updateQueueForBranch(activeBranchId, []);
+  }, [activeBranchId, branchesById, updateQueueForBranch]);
+
+  useEffect(() => {
+    if (!editingQueuedMessageId) {
+      return;
+    }
+
+    const exists = queuedMessages.some((queuedMessage) => queuedMessage.id === editingQueuedMessageId);
+    if (!exists) {
+      editingQueuedMessageIdRef.current = null;
+      setEditingQueuedMessageId(null);
+    }
+  }, [queuedMessages, editingQueuedMessageId]);
+
+  useEffect(() => {
     return () => {
       if (copyResetTimerRef.current) {
         window.clearTimeout(copyResetTimerRef.current);
@@ -683,8 +1304,55 @@ function App() {
     }
   }, [activeBranchId, branchesById]);
 
+  useEffect(() => {
+    setQueueDraftSnapshot('');
+  }, [activeBranchId]);
+
+  useEffect(() => {
+    if (!isBranchMapOpen) {
+      return;
+    }
+
+    const handleEscape = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setIsBranchMapOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [isBranchMapOpen]);
+
+  useEffect(() => {
+    if (activeTranscriptSlideIndex === null) {
+      return;
+    }
+
+    const handleEscape = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setActiveTranscriptSlideIndex(null);
+      }
+    };
+
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [activeTranscriptSlideIndex]);
+
   const hasDeck = Boolean(deck?.deck_id);
   const splitPercentage = Number((splitRatio * 100).toFixed(1));
+  const transcriptsBySlide = useMemo(() => {
+    const mapping = new Map();
+    for (const entry of transcriptState.slides || []) {
+      mapping.set(entry.index, entry);
+    }
+    return mapping;
+  }, [transcriptState.slides]);
+  const transcriptProgressLabel = useMemo(
+    () => describeTranscriptGeneration(transcriptState),
+    [transcriptState]
+  );
 
   const clampSplitRatio = useCallback((ratio, containerWidth = 0) => {
     const safeRatio = Number.isFinite(ratio) ? ratio : DEFAULT_SPLIT_RATIO;
@@ -738,6 +1406,15 @@ function App() {
     return 'Ask a question about the slides...';
   }, [focusedSlideIndex, hasDeck]);
 
+  async function fetchTranscriptSnapshot(deckId) {
+    const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/transcripts`));
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.detail || 'Failed to load transcripts');
+    }
+    return response.json();
+  }
+
   async function fetchSlides(deckId) {
     const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/slides`));
     if (!response.ok) {
@@ -750,6 +1427,47 @@ function App() {
     setCurrentSlideIndex(0);
     setFocusedSlideIndex(null);
   }
+
+  useEffect(() => {
+    if (!deck?.deck_id) {
+      return;
+    }
+
+    let isCancelled = false;
+    let timeoutId = null;
+
+    const pollTranscriptState = async () => {
+      try {
+        const snapshot = await fetchTranscriptSnapshot(deck.deck_id);
+        if (isCancelled) {
+          return;
+        }
+
+        setTranscriptState(snapshot);
+
+        if (snapshot.status === 'queued' || snapshot.status === 'generating') {
+          timeoutId = window.setTimeout(pollTranscriptState, TRANSCRIPT_POLL_INTERVAL_MS);
+        }
+      } catch (pollError) {
+        if (!isCancelled) {
+          setTranscriptState((previous) => ({
+            ...previous,
+            status: 'error',
+            error: normalizeError(pollError, 'Failed to load transcripts'),
+          }));
+        }
+      }
+    };
+
+    pollTranscriptState();
+
+    return () => {
+      isCancelled = true;
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [deck?.deck_id]);
 
   async function safeDeleteDeck(deckId) {
     if (!deckId) {
@@ -768,6 +1486,7 @@ function App() {
   async function processUploadFile(file) {
     setError('');
     setUploading(true);
+    resetTranscriptState(0);
 
     try {
       if (deck?.deck_id) {
@@ -790,6 +1509,7 @@ function App() {
       const payload = await response.json();
       setDeck(payload);
       resetBranches();
+      resetTranscriptState(payload.slide_count || 0);
       setInputValue('');
       await fetchSlides(payload.deck_id);
     } catch (uploadError) {
@@ -797,6 +1517,7 @@ function App() {
       setDeck(null);
       setSlides([]);
       resetBranches();
+      resetTranscriptState(0);
     } finally {
       setUploading(false);
     }
@@ -888,6 +1609,14 @@ function App() {
     setFocusedSlideIndex((prev) => (prev === index ? null : index));
   }
 
+  function openTranscriptModal(slideIndex) {
+    setActiveTranscriptSlideIndex((previous) => (previous === slideIndex ? null : slideIndex));
+  }
+
+  function closeTranscriptModal() {
+    setActiveTranscriptSlideIndex(null);
+  }
+
   function scrollToSlide(index) {
     const clamped = Math.max(0, Math.min(index, slides.length - 1));
     const target = slideRefs.current[clamped];
@@ -953,6 +1682,10 @@ function App() {
         return;
       }
 
+      if (isBranchMapOpen) {
+        return;
+      }
+
       if (isEditableTarget(event.target)) {
         return;
       }
@@ -993,7 +1726,17 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [hasDeck, slides.length, branchOrder.length, switchBranchByOffset]);
+  }, [hasDeck, slides.length, branchOrder.length, switchBranchByOffset, isBranchMapOpen]);
+
+  useEffect(() => {
+    if (activeTranscriptSlideIndex === null) {
+      return;
+    }
+    if (activeTranscriptSlideIndex < slides.length) {
+      return;
+    }
+    setActiveTranscriptSlideIndex(null);
+  }, [activeTranscriptSlideIndex, slides.length]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -1160,35 +1903,6 @@ function App() {
     setMessageDraft('');
   }
 
-  function createBranchFromAssistant(messageId) {
-    const sourceIndex = messages.findIndex(
-      (message) => message.id === messageId && message.role === 'assistant'
-    );
-    if (sourceIndex < 0) {
-      return;
-    }
-
-    const branchId = `branch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    branchCounterRef.current += 1;
-
-    setBranchesById((previous) => ({
-      ...previous,
-      [branchId]: {
-        id: branchId,
-        label: `Branch ${branchCounterRef.current}`,
-        parentBranchId: activeBranchId,
-        parentMessageId: messageId,
-        messages: messages.slice(0, sourceIndex + 1).map((message) => ({ ...message })),
-      },
-    }));
-    setBranchOrder((previous) => [...previous, branchId]);
-    setActiveBranchId(branchId);
-    setEditingMessageId(null);
-    setMessageDraft('');
-    setCopiedMessageId(null);
-    setError('');
-  }
-
   async function copyMessage(messageId) {
     const message = messages.find((item) => item.id === messageId);
     if (!message) {
@@ -1209,48 +1923,52 @@ function App() {
     }
   }
 
-  async function sendMessage(event) {
-    event.preventDefault();
-
-    if (!deck?.deck_id || sending) {
-      return;
+  async function streamMessageToBranch({ branchId, question, queuedMessageId = null }) {
+    const normalizedQuestion = String(question || '').trim();
+    if (!deck?.deck_id || !branchId || sendingRef.current || !normalizedQuestion) {
+      return false;
     }
 
-    const question = inputValue.trim();
-    if (!question) {
-      return;
+    const branchSnapshot = branchesRef.current[branchId];
+    if (!branchSnapshot) {
+      return false;
+    }
+
+    if (queuedMessageId) {
+      removeQueuedMessage(branchId, queuedMessageId);
     }
 
     setError('');
-    setInputValue('');
-
-    const targetBranchId = activeBranchId;
-    const branchHistory = messages
+    const branchHistory = branchSnapshot.messages
       .filter((message) => message.id !== WELCOME_MESSAGE.id)
       .map((message) => ({
         role: message.role,
         content: message.content,
       }));
 
+    const timestamp = Date.now();
+    const randomId = Math.random().toString(36).slice(2, 8);
     const userMessage = {
-      id: `user-${Date.now()}`,
+      id: `user-${timestamp}-${randomId}`,
       role: 'user',
-      content: question,
+      content: normalizedQuestion,
     };
 
-    const assistantId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const assistantId = `assistant-${timestamp}-${Math.random().toString(36).slice(2, 8)}`;
     const assistantMessage = {
       id: assistantId,
       role: 'assistant',
       content: '',
     };
 
-    updateBranchMessages(targetBranchId, (previous) => [
+    updateBranchMessages(branchId, (previous) => [
       ...previous,
       userMessage,
       assistantMessage,
     ]);
+    sendingRef.current = true;
     setSending(true);
+    setStreamingBranchId(branchId);
 
     try {
       const response = await fetch(apiUrl(`/api/v1/decks/${deck.deck_id}/chat/stream`), {
@@ -1259,7 +1977,7 @@ function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          question,
+          question: normalizedQuestion,
           history: branchHistory,
           current_slide_index: currentSlideIndex,
           focused_slide_index: focusedSlideIndex,
@@ -1273,7 +1991,7 @@ function App() {
 
       await consumeSse(response, (payload) => {
         if (payload.type === 'chunk' && typeof payload.text === 'string') {
-          updateBranchMessages(targetBranchId, (previous) =>
+          updateBranchMessages(branchId, (previous) =>
             previous.map((message) =>
               message.id === assistantId
                 ? { ...message, content: message.content + payload.text }
@@ -1285,7 +2003,7 @@ function App() {
 
         if (payload.type === 'error') {
           const message = payload.message || 'Unknown AI error';
-          updateBranchMessages(targetBranchId, (previous) =>
+          updateBranchMessages(branchId, (previous) =>
             previous.map((item) =>
               item.id === assistantId
                 ? { ...item, content: `Error: ${message}` }
@@ -1296,7 +2014,7 @@ function App() {
       });
     } catch (streamError) {
       const message = normalizeError(streamError, 'Failed to stream AI response');
-      updateBranchMessages(targetBranchId, (previous) =>
+      updateBranchMessages(branchId, (previous) =>
         previous.map((item) =>
           item.id === assistantId
             ? { ...item, content: `Error: ${message}` }
@@ -1305,9 +2023,323 @@ function App() {
       );
       setError(message);
     } finally {
+      sendingRef.current = false;
       setSending(false);
-      inputRef.current?.focus();
+      setStreamingBranchId(null);
+
+      const nextQueuedMessage = getNextQueuedMessageToSend(branchId);
+      if (nextQueuedMessage?.content?.trim()) {
+        window.setTimeout(() => {
+          void streamMessageToBranch({
+            branchId,
+            question: nextQueuedMessage.content,
+            queuedMessageId: nextQueuedMessage.id,
+          });
+        }, 0);
+      } else if (branchId === activeBranchIdRef.current) {
+        inputRef.current?.focus();
+      }
     }
+
+    return true;
+  }
+
+  function continueQueuedMessagesIfPossible(branchId) {
+    if (sendingRef.current || clearingChat) {
+      return;
+    }
+
+    const nextQueuedMessage = getNextQueuedMessageToSend(branchId);
+    if (!nextQueuedMessage?.content?.trim()) {
+      return;
+    }
+
+    void streamMessageToBranch({
+      branchId,
+      question: nextQueuedMessage.content,
+      queuedMessageId: nextQueuedMessage.id,
+    });
+  }
+
+  async function submitComposerMessage() {
+    if (!deck?.deck_id || clearingChat) {
+      return;
+    }
+
+    const question = inputValue.trim();
+    if (!question) {
+      return;
+    }
+
+    if (sendingRef.current) {
+      if (!editingQueuedMessageId) {
+        enqueueMessageForBranch(activeBranchId, question);
+      }
+      setInputValue('');
+      editingQueuedMessageIdRef.current = null;
+      setEditingQueuedMessageId(null);
+      setQueueDraftSnapshot('');
+      return;
+    }
+
+    if (editingQueuedMessageId) {
+      setInputValue('');
+      editingQueuedMessageIdRef.current = null;
+      setEditingQueuedMessageId(null);
+      setQueueDraftSnapshot('');
+      window.setTimeout(() => {
+        continueQueuedMessagesIfPossible(activeBranchId);
+      }, 0);
+      return;
+    }
+
+    setInputValue('');
+    await streamMessageToBranch({
+      branchId: activeBranchId,
+      question,
+      queuedMessageId: null,
+    });
+  }
+
+  async function sendMessage(event) {
+    event.preventDefault();
+    await submitComposerMessage();
+  }
+
+  async function sendQueuedMessageNow(queuedMessageId) {
+    if (sendingRef.current) {
+      return;
+    }
+
+    if (editingQueuedMessageId === queuedMessageId) {
+      return;
+    }
+
+    const branchQueue = queuedMessagesByBranchRef.current[activeBranchId] || [];
+    const queuedMessage = branchQueue.find((item) => item.id === queuedMessageId);
+    if (!queuedMessage?.content?.trim()) {
+      return;
+    }
+
+    setInputValue('');
+    editingQueuedMessageIdRef.current = null;
+    setEditingQueuedMessageId(null);
+    setQueueDraftSnapshot('');
+
+    await streamMessageToBranch({
+      branchId: activeBranchId,
+      question: queuedMessage.content,
+      queuedMessageId,
+    });
+  }
+
+  function focusQueuedMessageForEditing(queuedMessageId) {
+    const branchQueue = queuedMessagesByBranchRef.current[activeBranchId] || [];
+    const queuedMessage = branchQueue.find((item) => item.id === queuedMessageId);
+    if (!queuedMessage) {
+      return;
+    }
+
+    if (!editingQueuedMessageId) {
+      setQueueDraftSnapshot(inputValue);
+    }
+    editingQueuedMessageIdRef.current = queuedMessageId;
+    setEditingQueuedMessageId(queuedMessageId);
+    setInputValue(queuedMessage.content);
+    inputRef.current?.focus();
+  }
+
+  function removeQueuedMessageFromActiveBranch(queuedMessageId) {
+    removeQueuedMessage(activeBranchId, queuedMessageId);
+    if (editingQueuedMessageId === queuedMessageId) {
+      editingQueuedMessageIdRef.current = null;
+      setEditingQueuedMessageId(null);
+      setQueueDraftSnapshot('');
+      setInputValue('');
+      inputRef.current?.focus();
+      window.setTimeout(() => {
+        continueQueuedMessagesIfPossible(activeBranchId);
+      }, 0);
+    }
+  }
+
+  function handleComposerChange(event) {
+    const nextValue = event.target.value;
+    setInputValue(nextValue);
+
+    if (!editingQueuedMessageId) {
+      return;
+    }
+
+    if (!nextValue.trim()) {
+      removeQueuedMessage(activeBranchId, editingQueuedMessageId);
+      editingQueuedMessageIdRef.current = null;
+      setEditingQueuedMessageId(null);
+      setQueueDraftSnapshot('');
+      window.setTimeout(() => {
+        continueQueuedMessagesIfPossible(activeBranchId);
+      }, 0);
+      return;
+    }
+
+    updateQueuedMessage(activeBranchId, editingQueuedMessageId, nextValue);
+  }
+
+  function handleComposerKeyDown(event) {
+    if (event.nativeEvent?.isComposing) {
+      return;
+    }
+
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void submitComposerMessage();
+      return;
+    }
+
+    if (event.metaKey || event.ctrlKey || event.altKey) {
+      return;
+    }
+
+    if (event.key === 'Escape' && editingQueuedMessageId) {
+      event.preventDefault();
+      editingQueuedMessageIdRef.current = null;
+      setEditingQueuedMessageId(null);
+      setQueueDraftSnapshot('');
+      window.setTimeout(() => {
+        continueQueuedMessagesIfPossible(activeBranchId);
+      }, 0);
+      return;
+    }
+
+    if (event.key === 'ArrowUp') {
+      const atStart =
+        event.currentTarget.selectionStart === 0 &&
+        event.currentTarget.selectionEnd === 0;
+      if (!atStart || !queuedMessages.length) {
+        return;
+      }
+
+      event.preventDefault();
+      if (queueEditingIndex < 0) {
+        const newestIndex = queuedMessages.length - 1;
+        const newestMessage = queuedMessages[newestIndex];
+        if (!newestMessage) {
+          return;
+        }
+        setQueueDraftSnapshot(inputValue);
+        editingQueuedMessageIdRef.current = newestMessage.id;
+        setEditingQueuedMessageId(newestMessage.id);
+        setInputValue(newestMessage.content);
+        return;
+      }
+
+      const previousIndex = Math.max(0, queueEditingIndex - 1);
+      const previousMessage = queuedMessages[previousIndex];
+      if (!previousMessage) {
+        return;
+      }
+      editingQueuedMessageIdRef.current = previousMessage.id;
+      setEditingQueuedMessageId(previousMessage.id);
+      setInputValue(previousMessage.content);
+      return;
+    }
+
+    if (event.key === 'ArrowDown' && queueEditingIndex >= 0) {
+      const atEnd =
+        event.currentTarget.selectionStart === inputValue.length &&
+        event.currentTarget.selectionEnd === inputValue.length;
+      if (!atEnd) {
+        return;
+      }
+
+      event.preventDefault();
+      const nextIndex = queueEditingIndex + 1;
+      if (nextIndex >= queuedMessages.length) {
+        editingQueuedMessageIdRef.current = null;
+        setEditingQueuedMessageId(null);
+        setInputValue(queueDraftSnapshot);
+        setQueueDraftSnapshot('');
+        window.setTimeout(() => {
+          continueQueuedMessagesIfPossible(activeBranchId);
+        }, 0);
+        return;
+      }
+
+      const nextMessage = queuedMessages[nextIndex];
+      if (!nextMessage) {
+        return;
+      }
+      editingQueuedMessageIdRef.current = nextMessage.id;
+      setEditingQueuedMessageId(nextMessage.id);
+      setInputValue(nextMessage.content);
+    }
+  }
+
+  function renderBranchNodes(nodes, depth = 0) {
+    if (!nodes.length) {
+      return null;
+    }
+
+    return (
+      <ul className={`branch-tree-level ${depth === 0 ? 'root' : 'nested'}`} role={depth === 0 ? 'list' : undefined}>
+        {nodes.map((node) => (
+          <li key={node.key} className="branch-tree-item">
+            <button
+              type="button"
+              className={`branch-node ${node.isActive ? 'active' : ''}`}
+              onClick={() => handleTreeNodeClick(node)}
+              title={node.tooltip}
+            >
+              <div className="branch-node-head">
+                <span className="branch-node-title">{node.label}</span>
+                <span className="branch-node-meta">
+                  {node.turnCount} turns · {node.messageCount} messages
+                </span>
+              </div>
+              <p className="branch-node-kind">
+                {node.kindLabel}
+              </p>
+              <span className="branch-node-tooltip" role="tooltip">
+                {node.tooltip}
+              </span>
+            </button>
+            {node.childContext ? renderContextNodes([node.childContext], depth + 1) : null}
+          </li>
+        ))}
+      </ul>
+    );
+  }
+
+  function renderContextNodes(nodes, depth = 0) {
+    if (!nodes.length) {
+      return null;
+    }
+
+    return (
+      <ul className={`branch-tree-level ${depth === 0 ? 'root' : 'nested'}`} role={depth === 0 ? 'list' : undefined}>
+        {nodes.map((node) => (
+          <li key={node.key} className="branch-tree-item">
+            {node.canBranch ? (
+              <button
+                type="button"
+                className="branch-context-node interactive"
+                title={node.tooltip}
+                onClick={() => handleContextNodeClick(node)}
+              >
+                <p className="branch-context-title">{node.title}</p>
+                <p className="branch-context-meta">{node.summary}</p>
+              </button>
+            ) : (
+              <div className="branch-context-node" title={node.tooltip}>
+                <p className="branch-context-title">{node.title}</p>
+                <p className="branch-context-meta">{node.summary}</p>
+              </div>
+            )}
+            {renderBranchNodes(node.branches, depth + 1)}
+          </li>
+        ))}
+      </ul>
+    );
   }
 
   return (
@@ -1362,6 +2394,14 @@ function App() {
                 >
                   Hide Slides
                 </button>
+                {transcriptProgressLabel ? (
+                  <p
+                    className={`transcript-progress transcript-progress-${transcriptState.status}`}
+                    aria-live="polite"
+                  >
+                    {transcriptProgressLabel}
+                  </p>
+                ) : null}
               </div>
 
               <div
@@ -1374,6 +2414,19 @@ function App() {
                 {slides.length ? (
                   slides.map((slide) => {
                     const isFocused = focusedSlideIndex === slide.index;
+                    const isTranscriptOpen = activeTranscriptSlideIndex === slide.index;
+                    const slideTranscript = transcriptsBySlide.get(slide.index) || null;
+                    const hasTranscript = Boolean(slideTranscript?.transcript);
+                    const transcriptStatus = slideTranscript?.status || 'pending';
+                    const transcriptButtonLabel = isTranscriptOpen
+                      ? 'Hide'
+                      : hasTranscript
+                        ? 'Transcript'
+                      : transcriptStatus === 'generating' || transcriptState.status === 'queued'
+                        ? 'Preparing'
+                        : transcriptStatus === 'error'
+                          ? 'Unavailable'
+                          : 'Pending';
                     return (
                       <article
                         key={slide.index}
@@ -1384,7 +2437,45 @@ function App() {
                         onClick={() => toggleFocus(slide.index)}
                       >
                         <p className="slide-label">Slide {slide.index + 1}</p>
+                        {isTranscriptOpen ? (
+                          <section
+                            className="slide-transcript-row"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              closeTranscriptModal();
+                            }}
+                          >
+                            <div className="slide-transcript-row-body">
+                              {hasTranscript ? (
+                                <p className="slide-transcript-row-text">{slideTranscript.transcript}</p>
+                              ) : transcriptStatus === 'error' ? (
+                                <p className="slide-transcript-row-state error">
+                                  {slideTranscript?.error || 'Transcript generation failed for this slide.'}
+                                </p>
+                              ) : transcriptState.status === 'error' ? (
+                                <p className="slide-transcript-row-state error">
+                                  {transcriptState.error || 'Transcript generation ended with errors.'}
+                                </p>
+                              ) : (
+                                <p className="slide-transcript-row-state">
+                                  Transcript is being prepared for this slide.
+                                </p>
+                              )}
+                            </div>
+                          </section>
+                        ) : null}
                         <div className="slide-image-wrap">
+                          <button
+                            type="button"
+                            className={`slide-transcript-btn ${hasTranscript ? 'ready' : ''}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openTranscriptModal(slide.index);
+                            }}
+                            aria-label={`${isTranscriptOpen ? 'Hide' : 'Open'} transcript for Slide ${slide.index + 1}`}
+                          >
+                            {transcriptButtonLabel}
+                          </button>
                           <img
                             src={slideImageUrl(slide.index)}
                             alt={`Slide ${slide.index + 1}`}
@@ -1466,8 +2557,16 @@ function App() {
             )}
             <div className="chat-actions">
               <p className="branch-status">
-                {activeBranch?.label || 'Branch'} {activeBranchIndex + 1}/{branchOrder.length} · Use ←/→
+                {activeBranch?.label || 'Branch'} {activeBranchIndex + 1}/{branchOrder.length} · Queue {queuedMessages.length} · Use ←/→
               </p>
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => setIsBranchMapOpen(true)}
+                disabled={!branchTree.hasNodes}
+              >
+                View Branches
+              </button>
               <button
                 type="button"
                 className="ghost-btn"
@@ -1500,21 +2599,132 @@ function App() {
             <div ref={messagesEndRef} />
           </div>
 
+          {queuedMessages.length ? (
+            <section className="queued-messages-panel" aria-live="polite">
+              <div className="queued-messages-header">
+                <p>
+                  Queued on {activeBranch?.label || 'Branch'}: {queuedMessages.length}
+                </p>
+                {sending && streamingBranchId === activeBranchId ? (
+                  <span>Sending in order...</span>
+                ) : editingQueuedMessageId ? (
+                  <span>Queue paused at edited item.</span>
+                ) : null}
+              </div>
+              <ul className="queued-message-list">
+                {queuedMessages.map((queuedMessage, index) => (
+                  <li
+                    key={queuedMessage.id}
+                    className={`queued-message-item ${
+                      editingQueuedMessageId === queuedMessage.id ? 'active' : ''
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      className="queued-message-text"
+                      title={queuedMessage.content}
+                      onClick={() => focusQueuedMessageForEditing(queuedMessage.id)}
+                    >
+                      <span className="queued-message-index">#{index + 1}</span>
+                      <span>{queuedMessage.content}</span>
+                    </button>
+                    <div className="queued-message-actions">
+                      {!sending &&
+                      index === 0 &&
+                      editingQueuedMessageId !== queuedMessage.id ? (
+                        <button
+                          type="button"
+                          className="message-action-btn primary"
+                          onClick={() => sendQueuedMessageNow(queuedMessage.id)}
+                        >
+                          Send Next
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="message-action-btn"
+                        onClick={() => focusQueuedMessageForEditing(queuedMessage.id)}
+                      >
+                        {editingQueuedMessageId === queuedMessage.id ? 'Editing' : 'Edit'}
+                      </button>
+                      <button
+                        type="button"
+                        className="message-action-btn"
+                        onClick={() => removeQueuedMessageFromActiveBranch(queuedMessage.id)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ) : null}
+
           <form className="chat-input" onSubmit={sendMessage}>
-            <input
+            <textarea
               ref={inputRef}
-              type="text"
               value={inputValue}
-              onChange={(event) => setInputValue(event.target.value)}
+              onChange={handleComposerChange}
+              onKeyDown={handleComposerKeyDown}
               placeholder={inputPlaceholder}
-              disabled={!hasDeck || sending || clearingChat}
+              disabled={!hasDeck || clearingChat}
+              rows={Math.min(5, Math.max(1, inputValue.split('\n').length))}
+              aria-label="Message composer"
             />
             <button type="submit" disabled={!hasDeck || sending || clearingChat || !inputValue.trim()}>
-              {sending ? '...' : 'Send'}
+              Send
             </button>
+            <p className="composer-hint">
+              {sending
+                ? 'AI is still responding. Press Enter to queue this branch message.'
+                : editingQueuedMessageId
+                  ? 'Editing queued message. Press Esc to leave queue edit mode.'
+                  : 'Press Enter to send. Shift+Enter adds a new line. Use ↑/↓ to browse queued prompts.'}
+            </p>
           </form>
         </section>
       </main>
+
+      {isBranchMapOpen ? (
+        <div
+          className="branch-map-backdrop"
+          role="presentation"
+          onClick={() => setIsBranchMapOpen(false)}
+        >
+          <section
+            className="branch-map-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Conversation branch map"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="branch-map-header">
+              <div>
+                <h3>Conversation Branches</h3>
+                <p>Click a branch to switch. Click a context node to create a new branch from that context.</p>
+              </div>
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => setIsBranchMapOpen(false)}
+              >
+                Close
+              </button>
+            </header>
+
+            <div className="branch-map-tree">
+              {branchTree.rootContexts.length ? (
+                <div className="branch-tree-shell">
+                  {renderContextNodes(branchTree.rootContexts)}
+                </div>
+              ) : (
+                <p className="branch-tree-empty">No branches yet.</p>
+              )}
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }

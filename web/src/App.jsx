@@ -2913,10 +2913,8 @@ function App() {
                     slidesToRender.map((slide) => {
                       const isFocused = focusedSlideIndex === slide.index;
                       const isTranscriptOpen = activeTranscriptSlideIndex === slide.index;
-                      const isNotesOpen = activeNotesSlideIndex === slide.index;
                       const slideTranscript = transcriptsBySlide.get(slide.index) || null;
                       const hasTranscript = Boolean(slideTranscript?.transcript);
-                      const hasNotes = Boolean(String(notesBySlide[slide.index] || '').trim());
                       const isBookmarked = bookmarkedSlideSet.has(slide.index);
                       const transcriptStatus = slideTranscript?.status || 'pending';
                       const transcriptButtonLabel = isTranscriptOpen
@@ -2979,43 +2977,7 @@ function App() {
                               </div>
                             </section>
                           ) : null}
-                          {isNotesOpen ? (
-                            <section
-                              className="slide-note-row"
-                              onClick={(event) => {
-                                event.stopPropagation();
-                              }}
-                            >
-                              <label
-                                className="slide-note-label"
-                                htmlFor={`slide-note-${slide.index}`}
-                              >
-                                Your note for Slide {slide.index + 1}
-                              </label>
-                              <textarea
-                                id={`slide-note-${slide.index}`}
-                                className="slide-note-editor"
-                                value={notesBySlide[slide.index] || ''}
-                                onChange={(event) =>
-                                  handleSlideNoteChange(slide.index, event.target.value)
-                                }
-                                placeholder="Write your own explanation, memory hook, or exam reminder."
-                                rows={4}
-                              />
-                            </section>
-                          ) : null}
                           <div className="slide-image-wrap">
-                            <button
-                              type="button"
-                              className={`slide-note-btn ${hasNotes ? 'ready' : ''}`}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                toggleSlideNotes(slide.index);
-                              }}
-                              aria-label={`${isNotesOpen ? 'Hide' : 'Open'} notes for Slide ${slide.index + 1}`}
-                            >
-                              {isNotesOpen ? 'Close Note' : hasNotes ? 'Notes' : 'Add Note'}
-                            </button>
                             <button
                               type="button"
                               className={`slide-transcript-btn ${hasTranscript ? 'ready' : ''}`}

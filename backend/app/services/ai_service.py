@@ -29,6 +29,7 @@ class AIService:
         question: str,
         current_slide_index: int | None,
         focused_slide_index: int | None,
+        history: list[dict[str, str]] | None = None,
     ) -> Generator[str, None, None]:
         if not self.is_available:
             yield "[Error: AI service not available. Set ANTHROPIC_API_KEY.]"
@@ -41,13 +42,21 @@ class AIService:
             )
             return
 
-        with deck.lock:
-            is_first_message = deck.is_first_message
-            history = list(deck.conversation_history[-20:])
+        if history is not None:
+            normalized_history = [
+                {"role": entry["role"], "content": entry["content"]}
+                for entry in history[-20:]
+                if entry.get("role") in {"user", "assistant"} and entry.get("content")
+            ]
+            is_first_message = len(normalized_history) == 0
+        else:
+            with deck.lock:
+                is_first_message = deck.is_first_message
+                normalized_history = list(deck.conversation_history[-20:])
 
-        user_content: list[dict] = [
-            self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=is_first_message)
-        ]
+        user_content: list[dict] = []
+        if is_first_message:
+            user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
 
         prompt_text = build_user_prompt(question)
         if focused_slide_index is not None:
@@ -56,12 +65,11 @@ class AIService:
             user_content.append(self._build_image_block(base64.b64encode(focus_png).decode("utf-8")))
             prompt_text = build_focus_prompt(question, slide_number)
         elif current_slide_index is not None:
-            # Keep contextual continuity in the prompt, even without focus image.
             prompt_text = build_user_prompt(f"(Current slide: {current_slide_index + 1})\n\n{question}")
 
         user_content.append(self._build_text_block(prompt_text))
 
-        messages = history + [{"role": "user", "content": user_content}]
+        messages = normalized_history + [{"role": "user", "content": user_content}]
 
         full_response = ""
         try:
@@ -78,10 +86,11 @@ class AIService:
             yield f"[Error: {exc}]"
             return
 
-        with deck.lock:
-            deck.conversation_history.append({"role": "user", "content": prompt_text})
-            deck.conversation_history.append({"role": "assistant", "content": full_response})
-            deck.is_first_message = False
+        if history is None:
+            with deck.lock:
+                deck.conversation_history.append({"role": "user", "content": prompt_text})
+                deck.conversation_history.append({"role": "assistant", "content": full_response})
+                deck.is_first_message = False
 
     @staticmethod
     def _build_pdf_document_block(pdf_base64: str, with_cache: bool = False) -> dict:

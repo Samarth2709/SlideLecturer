@@ -33,8 +33,14 @@ class DeckInfoResponse(BaseModel):
     created_at: datetime
 
 
+class ChatHistoryTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=50000)
+
+
 class ChatStreamRequest(BaseModel):
     question: str = Field(min_length=1, max_length=6000)
+    history: list[ChatHistoryTurn] = Field(default_factory=list, max_length=40)
     current_slide_index: int | None = Field(default=None, ge=0)
     focused_slide_index: int | None = Field(default=None, ge=0)
 

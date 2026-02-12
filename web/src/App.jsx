@@ -342,6 +342,8 @@ function MessageBubble({
   isEditing,
   editDraft,
   isCopied,
+  canBranch,
+  onBranchFromAssistant,
   onCopy,
   onEditStart,
   onEditCancel,
@@ -444,6 +446,17 @@ function MessageBubble({
               </button>
             </>
           )}
+          {message.role === 'assistant' && message.id !== WELCOME_MESSAGE.id ? (
+            <button
+              type="button"
+              className="message-action-btn"
+              onClick={() => onBranchFromAssistant(message.id)}
+              disabled={!canBranch}
+              aria-label={`Create branch from this ${roleLabel} response`}
+            >
+              Branch
+            </button>
+          ) : null}
         </div>
       </header>
       <div className={`message-content ${message.role}`}>
@@ -525,7 +538,17 @@ async function copyTextToClipboard(text) {
 function App() {
   const [deck, setDeck] = useState(null);
   const [slides, setSlides] = useState([]);
-  const [messages, setMessages] = useState([WELCOME_MESSAGE]);
+  const [branchesById, setBranchesById] = useState(() => ({
+    [MAIN_BRANCH_ID]: {
+      id: MAIN_BRANCH_ID,
+      label: 'Main',
+      parentBranchId: null,
+      parentMessageId: null,
+      messages: [WELCOME_MESSAGE],
+    },
+  }));
+  const [branchOrder, setBranchOrder] = useState([MAIN_BRANCH_ID]);
+  const [activeBranchId, setActiveBranchId] = useState(MAIN_BRANCH_ID);
   const [inputValue, setInputValue] = useState('');
   const [uploading, setUploading] = useState(false);
   const [sending, setSending] = useState(false);
@@ -550,6 +573,79 @@ function App() {
   const currentSlideIndexRef = useRef(0);
   const dragDepthRef = useRef(0);
   const copyResetTimerRef = useRef(null);
+  const branchCounterRef = useRef(1);
+
+  const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
+  const messages = activeBranch?.messages || [WELCOME_MESSAGE];
+  const activeBranchIndex = Math.max(0, branchOrder.indexOf(activeBranchId));
+
+  const resetBranches = useCallback(() => {
+    setBranchesById({
+      [MAIN_BRANCH_ID]: {
+        id: MAIN_BRANCH_ID,
+        label: 'Main',
+        parentBranchId: null,
+        parentMessageId: null,
+        messages: [WELCOME_MESSAGE],
+      },
+    });
+    setBranchOrder([MAIN_BRANCH_ID]);
+    setActiveBranchId(MAIN_BRANCH_ID);
+    branchCounterRef.current = 1;
+  }, []);
+
+  const updateBranchMessages = useCallback((branchId, updater) => {
+    setBranchesById((previous) => {
+      const targetBranch = previous[branchId];
+      if (!targetBranch) {
+        return previous;
+      }
+
+      const nextMessages =
+        typeof updater === 'function' ? updater(targetBranch.messages) : updater;
+
+      return {
+        ...previous,
+        [branchId]: {
+          ...targetBranch,
+          messages: nextMessages,
+        },
+      };
+    });
+  }, []);
+
+  const updateActiveBranchMessages = useCallback(
+    (updater) => {
+      updateBranchMessages(activeBranchId, updater);
+    },
+    [activeBranchId, updateBranchMessages]
+  );
+
+  const switchBranchByOffset = useCallback(
+    (offset) => {
+      if (branchOrder.length <= 1) {
+        return;
+      }
+
+      const currentIndex = branchOrder.indexOf(activeBranchId);
+      if (currentIndex < 0) {
+        return;
+      }
+
+      const nextIndex =
+        (currentIndex + offset + branchOrder.length) % branchOrder.length;
+      const nextBranchId = branchOrder[nextIndex];
+      if (!nextBranchId) {
+        return;
+      }
+
+      setActiveBranchId(nextBranchId);
+      setEditingMessageId(null);
+      setMessageDraft('');
+      setCopiedMessageId(null);
+    },
+    [activeBranchId, branchOrder]
+  );
 
   useEffect(() => {
     currentSlideIndexRef.current = currentSlideIndex;
@@ -580,6 +676,12 @@ function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!branchesById[activeBranchId]) {
+      setActiveBranchId(MAIN_BRANCH_ID);
+    }
+  }, [activeBranchId, branchesById]);
 
   const hasDeck = Boolean(deck?.deck_id);
   const splitPercentage = Number((splitRatio * 100).toFixed(1));
@@ -687,13 +789,14 @@ function App() {
 
       const payload = await response.json();
       setDeck(payload);
-      setMessages([WELCOME_MESSAGE]);
+      resetBranches();
       setInputValue('');
       await fetchSlides(payload.deck_id);
     } catch (uploadError) {
       setError(normalizeError(uploadError, 'Failed to upload deck'));
       setDeck(null);
       setSlides([]);
+      resetBranches();
     } finally {
       setUploading(false);
     }
@@ -764,6 +867,10 @@ function App() {
 
     const file = event.dataTransfer.files?.[0];
     resetDropState();
+
+    if (uploading || sending || file == null) {
+      return;
+    }
 
     if (file) {
       await processUploadFile(file);
@@ -857,10 +964,22 @@ function App() {
         return;
       }
 
-      if (['ArrowRight', ' ', 'PageDown', 'ArrowDown'].includes(key)) {
+      if (key === 'ArrowLeft' && branchOrder.length > 1) {
+        event.preventDefault();
+        switchBranchByOffset(-1);
+        return;
+      }
+
+      if (key === 'ArrowRight' && branchOrder.length > 1) {
+        event.preventDefault();
+        switchBranchByOffset(1);
+        return;
+      }
+
+      if ([' ', 'PageDown', 'ArrowDown'].includes(key)) {
         event.preventDefault();
         scrollToSlide(currentSlideIndexRef.current + 1);
-      } else if (['ArrowLeft', 'Backspace', 'PageUp', 'ArrowUp'].includes(key)) {
+      } else if (['Backspace', 'PageUp', 'ArrowUp'].includes(key)) {
         event.preventDefault();
         scrollToSlide(currentSlideIndexRef.current - 1);
       } else if (key === 'Home') {
@@ -874,7 +993,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [hasDeck, slides.length]);
+  }, [hasDeck, slides.length, branchOrder.length, switchBranchByOffset]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -938,24 +1057,28 @@ function App() {
 
     if (event.key === 'ArrowLeft') {
       event.preventDefault();
+      event.stopPropagation();
       setSplitRatio((previous) => clampSplitRatio(previous - 0.02));
       return;
     }
 
     if (event.key === 'ArrowRight') {
       event.preventDefault();
+      event.stopPropagation();
       setSplitRatio((previous) => clampSplitRatio(previous + 0.02));
       return;
     }
 
     if (event.key === 'Home') {
       event.preventDefault();
+      event.stopPropagation();
       setSplitRatio(() => clampSplitRatio(SPLIT_MIN_RATIO));
       return;
     }
 
     if (event.key === 'End') {
       event.preventDefault();
+      event.stopPropagation();
       setSplitRatio(() => clampSplitRatio(SPLIT_MAX_RATIO));
     }
   }
@@ -970,7 +1093,7 @@ function App() {
     setError('');
 
     if (!deck?.deck_id) {
-      setMessages([WELCOME_MESSAGE]);
+      resetBranches();
       setInputValue('');
       setEditingMessageId(null);
       setMessageDraft('');
@@ -990,7 +1113,7 @@ function App() {
         throw new Error(data.detail || 'Failed to clear chat');
       }
 
-      setMessages([WELCOME_MESSAGE]);
+      resetBranches();
       setInputValue('');
       setEditingMessageId(null);
       setMessageDraft('');
@@ -1026,7 +1149,7 @@ function App() {
       return;
     }
 
-    setMessages((previous) =>
+    updateActiveBranchMessages((previous) =>
       previous.map((message) =>
         message.id === messageId
           ? { ...message, content: messageDraft }
@@ -1035,6 +1158,35 @@ function App() {
     );
     setEditingMessageId(null);
     setMessageDraft('');
+  }
+
+  function createBranchFromAssistant(messageId) {
+    const sourceIndex = messages.findIndex(
+      (message) => message.id === messageId && message.role === 'assistant'
+    );
+    if (sourceIndex < 0) {
+      return;
+    }
+
+    const branchId = `branch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    branchCounterRef.current += 1;
+
+    setBranchesById((previous) => ({
+      ...previous,
+      [branchId]: {
+        id: branchId,
+        label: `Branch ${branchCounterRef.current}`,
+        parentBranchId: activeBranchId,
+        parentMessageId: messageId,
+        messages: messages.slice(0, sourceIndex + 1).map((message) => ({ ...message })),
+      },
+    }));
+    setBranchOrder((previous) => [...previous, branchId]);
+    setActiveBranchId(branchId);
+    setEditingMessageId(null);
+    setMessageDraft('');
+    setCopiedMessageId(null);
+    setError('');
   }
 
   async function copyMessage(messageId) {
@@ -1072,6 +1224,14 @@ function App() {
     setError('');
     setInputValue('');
 
+    const targetBranchId = activeBranchId;
+    const branchHistory = messages
+      .filter((message) => message.id !== WELCOME_MESSAGE.id)
+      .map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
+
     const userMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
@@ -1085,7 +1245,11 @@ function App() {
       content: '',
     };
 
-    setMessages((prev) => [...prev, userMessage, assistantMessage]);
+    updateBranchMessages(targetBranchId, (previous) => [
+      ...previous,
+      userMessage,
+      assistantMessage,
+    ]);
     setSending(true);
 
     try {
@@ -1096,6 +1260,8 @@ function App() {
         },
         body: JSON.stringify({
           question,
+          history: branchHistory,
+          current_slide_index: currentSlideIndex,
           focused_slide_index: focusedSlideIndex,
         }),
       });
@@ -1107,8 +1273,8 @@ function App() {
 
       await consumeSse(response, (payload) => {
         if (payload.type === 'chunk' && typeof payload.text === 'string') {
-          setMessages((prev) =>
-            prev.map((message) =>
+          updateBranchMessages(targetBranchId, (previous) =>
+            previous.map((message) =>
               message.id === assistantId
                 ? { ...message, content: message.content + payload.text }
                 : message
@@ -1119,8 +1285,8 @@ function App() {
 
         if (payload.type === 'error') {
           const message = payload.message || 'Unknown AI error';
-          setMessages((prev) =>
-            prev.map((item) =>
+          updateBranchMessages(targetBranchId, (previous) =>
+            previous.map((item) =>
               item.id === assistantId
                 ? { ...item, content: `Error: ${message}` }
                 : item
@@ -1130,8 +1296,8 @@ function App() {
       });
     } catch (streamError) {
       const message = normalizeError(streamError, 'Failed to stream AI response');
-      setMessages((prev) =>
-        prev.map((item) =>
+      updateBranchMessages(targetBranchId, (previous) =>
+        previous.map((item) =>
           item.id === assistantId
             ? { ...item, content: `Error: ${message}` }
             : item
@@ -1299,6 +1465,9 @@ function App() {
               </button>
             )}
             <div className="chat-actions">
+              <p className="branch-status">
+                {activeBranch?.label || 'Branch'} {activeBranchIndex + 1}/{branchOrder.length} · Use ←/→
+              </p>
               <button
                 type="button"
                 className="ghost-btn"
@@ -1318,6 +1487,8 @@ function App() {
                 isEditing={editingMessageId === message.id}
                 editDraft={editingMessageId === message.id ? messageDraft : ''}
                 isCopied={copiedMessageId === message.id}
+                canBranch={!sending && !clearingChat}
+                onBranchFromAssistant={createBranchFromAssistant}
                 onCopy={copyMessage}
                 onEditStart={startEditingMessage}
                 onEditCancel={cancelEditingMessage}

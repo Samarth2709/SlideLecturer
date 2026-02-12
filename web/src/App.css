@@ -435,6 +435,14 @@ body.is-resizing-split * {
   flex-wrap: wrap;
 }
 
+.branch-status {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
 .messages-list {
   flex: 1;
   overflow: auto;

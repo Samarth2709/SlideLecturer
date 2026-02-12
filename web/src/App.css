@@ -503,10 +503,10 @@ body.is-resizing-split * {
   min-width: 0;
 }
 
-.slide-note-btn,
 .slide-transcript-btn {
   position: absolute;
   top: 0.44rem;
+  right: 0.44rem;
   z-index: 2;
   border: 1px solid rgba(245, 245, 245, 0.9);
   border-radius: 999px;
@@ -522,31 +522,15 @@ body.is-resizing-split * {
   transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
 }
 
-.slide-note-btn {
-  left: 0.44rem;
-}
-
-.slide-transcript-btn {
-  right: 0.44rem;
-}
-
-.slide-note-btn:hover,
 .slide-transcript-btn:hover {
   background: rgba(28, 34, 43, 0.98);
   border-color: rgba(255, 255, 255, 1);
   transform: translateY(-1px);
 }
 
-.slide-note-btn:focus-visible,
 .slide-transcript-btn:focus-visible {
   outline: 2px solid rgba(255, 255, 255, 0.9);
   outline-offset: 1px;
-}
-
-.slide-note-btn.ready {
-  background: rgba(80, 58, 128, 0.95);
-  border-color: rgba(218, 194, 255, 0.95);
-  color: #f7f0ff;
 }
 
 .slide-transcript-btn.ready {
@@ -588,47 +572,6 @@ body.is-resizing-split * {
 
 .slide-transcript-row-state.error {
   color: #efb6b6;
-}
-
-.slide-note-row {
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.04);
-  margin: 0 0 0.38rem;
-  padding: 0.3rem 0.34rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.32rem;
-}
-
-.slide-note-label {
-  color: var(--text-muted);
-  font-size: 0.72rem;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.slide-note-editor {
-  width: 100%;
-  border: 1px solid rgba(255, 255, 255, 0.24);
-  border-radius: 8px;
-  background: rgba(7, 8, 11, 0.76);
-  color: var(--text-main);
-  font: inherit;
-  font-size: 0.84rem;
-  line-height: 1.4;
-  resize: vertical;
-  min-height: 72px;
-  padding: 0.44rem 0.5rem;
-}
-
-.slide-note-editor::placeholder {
-  color: #b5b5b5;
-}
-
-.slide-note-editor:focus-visible {
-  outline: 2px solid rgba(255, 255, 255, 0.55);
-  outline-offset: 1px;
 }
 
 .empty-state {
@@ -1336,7 +1279,6 @@ body.is-resizing-split * {
     max-height: 150px;
   }
 
-  .slide-note-btn,
   .slide-transcript-btn {
     font-size: 0.6rem;
     padding: 0.18rem 0.38rem;

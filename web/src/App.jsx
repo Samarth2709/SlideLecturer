@@ -23,6 +23,7 @@ const SPLITTER_WIDTH_PX = 12;
 const TRANSCRIPT_POLL_INTERVAL_MS = 1800;
 const DECK_PREFERENCES_STORAGE_PREFIX = 'slidelecturer.deckPreferences.v1';
 const SEARCH_SNIPPET_MAX_CHARS = 180;
+const MAX_CHAT_HISTORY_MESSAGES = 40;
 
 const EMPTY_TRANSCRIPT_STATE = Object.freeze({
   status: 'queued',
@@ -184,6 +185,10 @@ function describeTranscriptGeneration(state) {
   const completedSlides = Number(state?.completed_slides || 0);
   const generationStatus = state?.status || 'queued';
 
+  if (generationStatus === 'disabled') {
+    return 'Narration is off for this deck.';
+  }
+
   if (!totalSlides) {
     return '';
   }
@@ -203,6 +208,23 @@ function describeTranscriptGeneration(state) {
   }
 
   return `Preparing transcripts: ${completedSlides}/${totalSlides}`;
+}
+
+function formatPlaybackClock(totalSeconds) {
+  const seconds = Number(totalSeconds);
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return '--:--';
+  }
+
+  const rounded = Math.floor(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remainder = rounded % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
+  }
+  return `${minutes}:${String(remainder).padStart(2, '0')}`;
 }
 
 function loadInitialSplitRatio() {
@@ -230,6 +252,78 @@ function normalizeError(error, fallback) {
     return error.message;
   }
   return fallback;
+}
+
+function formatApiErrorDetail(detail) {
+  if (typeof detail === 'string' && detail.trim()) {
+    return detail.trim();
+  }
+
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((entry) => {
+        if (typeof entry === 'string' && entry.trim()) {
+          return entry.trim();
+        }
+        if (!entry || typeof entry !== 'object') {
+          return '';
+        }
+
+        const location = Array.isArray(entry.loc)
+          ? entry.loc
+            .map((segment) => String(segment || '').trim())
+            .filter((segment) => segment && segment !== 'body')
+            .join('.')
+          : '';
+        const message = typeof entry.msg === 'string' ? entry.msg.trim() : '';
+        if (location && message) {
+          return `${location}: ${message}`;
+        }
+        return message || location;
+      })
+      .filter(Boolean);
+
+    if (messages.length) {
+      return messages.join('; ');
+    }
+  }
+
+  if (detail && typeof detail === 'object') {
+    for (const key of ['message', 'error']) {
+      const candidate = detail[key];
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+
+    try {
+      const serialized = JSON.stringify(detail);
+      if (serialized && serialized !== '{}') {
+        return serialized;
+      }
+    } catch (error) {
+      console.error('Failed to serialize API error detail', error);
+    }
+  }
+
+  return '';
+}
+
+function extractApiErrorMessage(payload, fallback) {
+  const formatted = formatApiErrorDetail(payload?.detail);
+  return formatted || fallback;
+}
+
+function normalizeContextIndex(value) {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
+}
+
+function buildRequestContextSnapshot(context = {}) {
+  return {
+    currentSlideIndex: normalizeContextIndex(context.currentSlideIndex),
+    focusedSlideIndex: normalizeContextIndex(context.focusedSlideIndex),
+  };
 }
 
 function extractEventData(rawEvent) {
@@ -521,6 +615,100 @@ function preprocessAssistantMarkdown(markdown) {
   return convertInlineCodeRunsToFences(markdown);
 }
 
+function StarIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path
+        d="M12 2.6l2.9 5.88 6.49.94-4.69 4.58 1.1 6.47L12 17.43l-5.8 3.05 1.1-6.47-4.69-4.58 6.49-.94L12 2.6z"
+        fill="currentColor"
+      />
+    </svg>
+  );
+}
+
+function SpeakerIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path
+        d="M4.3 9h3.9l4.8-3.8v13.6L8.2 15H4.3V9z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M16 9.1a4.1 4.1 0 010 5.8"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+      <path
+        d="M18.8 6.8a7.2 7.2 0 010 10.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
+function CopyIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <rect x="9" y="9" width="10" height="10" rx="2" ry="2" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <rect x="5" y="5" width="10" height="10" rx="2" ry="2" fill="none" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function CheckIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M5 12.6l4.2 4.2L19 7" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function EditIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M14.8 4.2l5 5L9.1 19.8l-4.9 1.1 1.1-4.9L14.8 4.2z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M12.9 6.1l5 5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function BranchTreeIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <circle cx="12" cy="5.2" r="2.2" fill="currentColor" />
+      <circle cx="5.8" cy="18.2" r="2.2" fill="currentColor" />
+      <circle cx="18.2" cy="18.2" r="2.2" fill="currentColor" />
+      <path d="M12 7.8v3.2M7 16.1l4.7-4.7M17 16.1l-4.7-4.7" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function ClearChatIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M4.5 14.2l5.6-5.6 8 8-5.6 5.6H4.5v-8z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M11.4 6.9l2.2-2.2h5.9v5.9l-2.2 2.2" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M6.9 19.9h5.8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function SendIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M3 20.4l18-8.4L3 3.6l2.3 7 7.2 1.4-7.2 1.4-2.3 7z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function MessageBubble({
   message,
   isEditing,
@@ -594,20 +782,22 @@ function MessageBubble({
         <div className="message-actions">
           <button
             type="button"
-            className="message-action-btn"
+            className={`message-action-btn icon-only ${isCopied ? 'success' : ''}`}
             onClick={() => onCopy(message.id)}
             aria-label={`Copy ${roleLabel} message`}
+            title={isCopied ? 'Copied' : 'Copy'}
           >
-            {isCopied ? 'Copied' : 'Copy'}
+            {isCopied ? <CheckIcon /> : <CopyIcon />}
           </button>
           {!isEditing ? (
             <button
               type="button"
-              className="message-action-btn"
+              className="message-action-btn icon-only"
               onClick={() => onEditStart(message.id)}
               aria-label={`Edit ${roleLabel} message`}
+              title="Edit"
             >
-              Edit
+              <EditIcon />
             </button>
           ) : (
             <>
@@ -753,6 +943,12 @@ function App() {
   const [slidesVisible, setSlidesVisible] = useState(true);
   const [transcriptState, setTranscriptState] = useState(() => buildEmptyTranscriptState());
   const [activeTranscriptSlideIndex, setActiveTranscriptSlideIndex] = useState(null);
+  const [activeSpeechSlideIndex, setActiveSpeechSlideIndex] = useState(null);
+  const [speechStatus, setSpeechStatus] = useState('idle');
+  const [speechCurrentTimeSeconds, setSpeechCurrentTimeSeconds] = useState(0);
+  const [speechDurationSeconds, setSpeechDurationSeconds] = useState(0);
+  const [speechIsBuffering, setSpeechIsBuffering] = useState(false);
+  const [narrateEnabled, setNarrateEnabled] = useState(true);
   const [bookmarkedSlideIndices, setBookmarkedSlideIndices] = useState([]);
   const [showBookmarkedOnly, setShowBookmarkedOnly] = useState(false);
   const [slideSearchQuery, setSlideSearchQuery] = useState('');
@@ -777,6 +973,8 @@ function App() {
   const activeBranchIdRef = useRef(activeBranchId);
   const clearingChatRef = useRef(clearingChat);
   const sendingRef = useRef(sending);
+  const speechAudioRef = useRef(null);
+  const speechRequestIdRef = useRef(0);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
   const messages = activeBranch?.messages || [WELCOME_MESSAGE];
@@ -785,6 +983,33 @@ function App() {
   const queueEditingIndex = queuedMessages.findIndex(
     (queuedMessage) => queuedMessage.id === editingQueuedMessageId
   );
+  const resetSpeechPlaybackState = useCallback(() => {
+    setActiveSpeechSlideIndex(null);
+    setSpeechStatus('idle');
+    setSpeechCurrentTimeSeconds(0);
+    setSpeechDurationSeconds(0);
+    setSpeechIsBuffering(false);
+  }, []);
+  const clearSpeechAudio = useCallback(() => {
+    const activeAudio = speechAudioRef.current;
+    speechAudioRef.current = null;
+
+    if (activeAudio) {
+      activeAudio.onplay = null;
+      activeAudio.onpause = null;
+      activeAudio.onended = null;
+      activeAudio.onerror = null;
+      activeAudio.ontimeupdate = null;
+      activeAudio.ondurationchange = null;
+      activeAudio.onloadedmetadata = null;
+      activeAudio.onwaiting = null;
+      activeAudio.oncanplay = null;
+      activeAudio.oncanplaythrough = null;
+      activeAudio.pause();
+      activeAudio.removeAttribute('src');
+      activeAudio.load();
+    }
+  }, []);
 
   const branchTree = useMemo(() => {
     const nonWelcomeMessagesFor = (branch) =>
@@ -1160,7 +1385,7 @@ function App() {
   }, []);
 
   const enqueueMessageForBranch = useCallback(
-    (branchId, content) => {
+    (branchId, content, requestContext = null) => {
       const trimmedContent = String(content || '').trim();
       if (!trimmedContent) {
         return null;
@@ -1170,6 +1395,7 @@ function App() {
         id: `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         content: trimmedContent,
         createdAt: Date.now(),
+        requestContext: buildRequestContextSnapshot(requestContext || {}),
       };
 
       updateQueueForBranch(branchId, (existingQueue) => [...existingQueue, queuedMessage]);
@@ -1454,6 +1680,18 @@ function App() {
   }, []);
 
   useEffect(() => {
+    speechRequestIdRef.current += 1;
+    clearSpeechAudio();
+    resetSpeechPlaybackState();
+  }, [deck?.deck_id, clearSpeechAudio, resetSpeechPlaybackState]);
+
+  useEffect(() => {
+    return () => {
+      clearSpeechAudio();
+    };
+  }, [clearSpeechAudio]);
+
+  useEffect(() => {
     if (!branchesById[activeBranchId]) {
       setActiveBranchId(MAIN_BRANCH_ID);
     }
@@ -1480,6 +1718,7 @@ function App() {
   }, [isBranchMapOpen]);
 
   const hasDeck = Boolean(deck?.deck_id);
+  const isDeckNarrationEnabled = deck?.narrate_enabled !== false;
   const splitPercentage = Number((splitRatio * 100).toFixed(1));
   const transcriptsBySlide = useMemo(() => {
     const mapping = new Map();
@@ -1707,16 +1946,20 @@ function App() {
     const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/transcripts`));
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
-      throw new Error(data.detail || 'Failed to load transcripts');
+      throw new Error(extractApiErrorMessage(data, 'Failed to load transcripts'));
     }
     return response.json();
+  }
+
+  function transcriptSpeechStreamUrl(deckId, slideIndex) {
+    return apiUrl(`/api/v1/decks/${deckId}/slides/${slideIndex}/transcript/speech/stream`);
   }
 
   async function fetchSlides(deckId) {
     const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/slides`));
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
-      throw new Error(data.detail || 'Failed to load slides');
+      throw new Error(extractApiErrorMessage(data, 'Failed to load slides'));
     }
 
     const data = await response.json();
@@ -1792,6 +2035,7 @@ function App() {
 
       const form = new FormData();
       form.append('file', file);
+      form.append('narrate_enabled', String(narrateEnabled));
 
       const response = await fetch(apiUrl('/api/v1/decks/upload'), {
         method: 'POST',
@@ -1800,11 +2044,14 @@ function App() {
 
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        throw new Error(data.detail || 'Upload failed');
+        throw new Error(extractApiErrorMessage(data, 'Upload failed'));
       }
 
       const payload = await response.json();
       setDeck(payload);
+      if (typeof payload?.narrate_enabled === 'boolean') {
+        setNarrateEnabled(payload.narrate_enabled);
+      }
       resetBranches();
       resetTranscriptState(payload.slide_count || 0);
       setInputValue('');
@@ -1967,6 +2214,162 @@ function App() {
     setActiveTranscriptSlideIndex(null);
   }
 
+  async function toggleTranscriptSpeech(slideIndex, transcriptText) {
+    if (!deck?.deck_id) {
+      return;
+    }
+    if (deck?.narrate_enabled === false) {
+      return;
+    }
+
+    const normalizedTranscript = String(transcriptText || '').trim();
+    if (!normalizedTranscript) {
+      return;
+    }
+
+    const activeAudio = speechAudioRef.current;
+    const isCurrentSlideActive = activeSpeechSlideIndex === slideIndex && activeAudio;
+    if (isCurrentSlideActive) {
+      if (speechStatus === 'playing' || speechStatus === 'loading') {
+        activeAudio.pause();
+        return;
+      }
+
+      if (speechStatus === 'paused') {
+        try {
+          setSpeechIsBuffering(true);
+          await activeAudio.play();
+        } catch (playError) {
+          setSpeechIsBuffering(false);
+          setError(normalizeError(playError, 'Failed to resume transcript speech'));
+        }
+        return;
+      }
+    }
+
+    if (typeof Audio === 'undefined') {
+      setError('Audio playback is not supported in this browser.');
+      return;
+    }
+
+    const requestId = speechRequestIdRef.current + 1;
+    speechRequestIdRef.current = requestId;
+    clearSpeechAudio();
+
+    const audio = new Audio();
+    audio.preload = 'auto';
+    audio.src = transcriptSpeechStreamUrl(deck.deck_id, slideIndex);
+    speechAudioRef.current = audio;
+
+    setError('');
+    setActiveSpeechSlideIndex(slideIndex);
+    setSpeechStatus('loading');
+    setSpeechCurrentTimeSeconds(0);
+    setSpeechDurationSeconds(0);
+    setSpeechIsBuffering(true);
+
+    const syncProgress = () => {
+      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+        return;
+      }
+      setSpeechCurrentTimeSeconds(audio.currentTime || 0);
+      const nextDuration = Number(audio.duration);
+      if (Number.isFinite(nextDuration) && nextDuration > 0) {
+        setSpeechDurationSeconds(nextDuration);
+      }
+    };
+
+    audio.onloadedmetadata = syncProgress;
+    audio.ondurationchange = syncProgress;
+    audio.ontimeupdate = syncProgress;
+
+    audio.onwaiting = () => {
+      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+        return;
+      }
+      setSpeechIsBuffering(true);
+    };
+
+    audio.oncanplay = () => {
+      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+        return;
+      }
+      setSpeechIsBuffering(false);
+    };
+
+    audio.oncanplaythrough = () => {
+      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+        return;
+      }
+      setSpeechIsBuffering(false);
+    };
+
+    audio.onplay = () => {
+      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+        return;
+      }
+      setSpeechStatus('playing');
+      setSpeechIsBuffering(false);
+    };
+
+    audio.onpause = () => {
+      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+        return;
+      }
+      if (audio.ended) {
+        return;
+      }
+      setSpeechStatus('paused');
+      setSpeechIsBuffering(false);
+    };
+
+    audio.onended = () => {
+      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+        return;
+      }
+      clearSpeechAudio();
+      resetSpeechPlaybackState();
+    };
+
+    audio.onerror = () => {
+      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+        return;
+      }
+      clearSpeechAudio();
+      resetSpeechPlaybackState();
+      setError('Speech playback failed.');
+    };
+
+    try {
+      await audio.play();
+    } catch (speechError) {
+      if (speechRequestIdRef.current !== requestId) {
+        return;
+      }
+      clearSpeechAudio();
+      resetSpeechPlaybackState();
+      setError(normalizeError(speechError, 'Failed to play transcript speech'));
+    }
+  }
+
+  function seekTranscriptSpeechBy(secondsOffset) {
+    const audio = speechAudioRef.current;
+    if (!audio || activeSpeechSlideIndex === null) {
+      return;
+    }
+
+    const current = Number(audio.currentTime || 0);
+    const duration = Number(audio.duration);
+    const boundedDuration = Number.isFinite(duration) && duration > 0 ? duration : Number.POSITIVE_INFINITY;
+    const next = Math.max(0, Math.min(current + Number(secondsOffset || 0), boundedDuration));
+    if (!Number.isFinite(next)) {
+      return;
+    }
+
+    audio.currentTime = next;
+    setSpeechCurrentTimeSeconds(next);
+  }
+
   function scrollToSlide(index) {
     if (!slides.length) {
       return;
@@ -2079,10 +2482,6 @@ function App() {
 
   useEffect(() => {
     const handleKeyDown = (event) => {
-      if (!hasDeck) {
-        return;
-      }
-
       if (isBranchMapOpen) {
         return;
       }
@@ -2091,16 +2490,66 @@ function App() {
         return;
       }
 
-      const { key, ctrlKey, metaKey } = event;
-      const hasModifier = ctrlKey || metaKey;
+      const { key, ctrlKey, metaKey, altKey, repeat } = event;
+      const normalizedKey = String(key || '').toLowerCase();
+      const hasModifier = ctrlKey || metaKey || altKey;
 
-      if (key === '/' && !hasModifier) {
+      if (normalizedKey === 'h' && !hasModifier) {
+        if (repeat) {
+          return;
+        }
+        event.preventDefault();
+        setSlidesVisible((previous) => !previous);
+        return;
+      }
+
+      if (!hasDeck) {
+        return;
+      }
+
+      if (normalizedKey === '/' && !hasModifier) {
         event.preventDefault();
         slideSearchInputRef.current?.focus();
         return;
       }
 
       if (hasModifier) {
+        return;
+      }
+
+      if (repeat && ['q', 's', 't'].includes(normalizedKey)) {
+        return;
+      }
+
+      const currentIndexValue = Number(currentSlideIndexRef.current);
+      const activeSlideShortcutIndex = Number.isFinite(currentIndexValue)
+        ? Math.max(0, Math.min(Math.round(currentIndexValue), slides.length - 1))
+        : 0;
+
+      if (normalizedKey === 'q') {
+        event.preventDefault();
+        const composer = inputRef.current;
+        if (!composer || composer.disabled) {
+          return;
+        }
+
+        composer.focus();
+        const cursor = composer.value.length;
+        composer.setSelectionRange(cursor, cursor);
+        return;
+      }
+
+      if (normalizedKey === 's' && slidesVisible && slides.length) {
+        event.preventDefault();
+        toggleBookmark(activeSlideShortcutIndex);
+        return;
+      }
+
+      if (normalizedKey === 't' && slidesVisible && slides.length && isDeckNarrationEnabled) {
+        event.preventDefault();
+        setActiveTranscriptSlideIndex((previous) =>
+          previous === activeSlideShortcutIndex ? null : activeSlideShortcutIndex
+        );
         return;
       }
 
@@ -2139,6 +2588,9 @@ function App() {
     switchBranchByOffset,
     isBranchMapOpen,
     navigableSlideIndices,
+    isDeckNarrationEnabled,
+    slides.length,
+    slidesVisible,
   ]);
 
   useEffect(() => {
@@ -2150,6 +2602,19 @@ function App() {
     }
     setActiveTranscriptSlideIndex(null);
   }, [activeTranscriptSlideIndex, slides.length]);
+
+  useEffect(() => {
+    if (activeSpeechSlideIndex === null) {
+      return;
+    }
+    if (activeSpeechSlideIndex < slides.length) {
+      return;
+    }
+
+    speechRequestIdRef.current += 1;
+    clearSpeechAudio();
+    resetSpeechPlaybackState();
+  }, [activeSpeechSlideIndex, slides.length, clearSpeechAudio, resetSpeechPlaybackState]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -2267,7 +2732,7 @@ function App() {
 
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        throw new Error(data.detail || 'Failed to clear chat');
+        throw new Error(extractApiErrorMessage(data, 'Failed to clear chat'));
       }
 
       resetBranches();
@@ -2338,7 +2803,12 @@ function App() {
     }
   }
 
-  async function streamMessageToBranch({ branchId, question, queuedMessageId = null }) {
+  async function streamMessageToBranch({
+    branchId,
+    question,
+    queuedMessageId = null,
+    requestContext = null,
+  }) {
     const normalizedQuestion = String(question || '').trim();
     if (!deck?.deck_id || !branchId || sendingRef.current || !normalizedQuestion) {
       return false;
@@ -2356,10 +2826,17 @@ function App() {
     setError('');
     const branchHistory = branchSnapshot.messages
       .filter((message) => message.id !== WELCOME_MESSAGE.id)
+      .slice(-MAX_CHAT_HISTORY_MESSAGES)
       .map((message) => ({
         role: message.role,
         content: message.content,
       }));
+    const normalizedRequestContext = buildRequestContextSnapshot(
+      requestContext || {
+        currentSlideIndex,
+        focusedSlideIndex,
+      }
+    );
 
     const timestamp = Date.now();
     const randomId = Math.random().toString(36).slice(2, 8);
@@ -2394,14 +2871,14 @@ function App() {
         body: JSON.stringify({
           question: normalizedQuestion,
           history: branchHistory,
-          current_slide_index: currentSlideIndex,
-          focused_slide_index: focusedSlideIndex,
+          current_slide_index: normalizedRequestContext.currentSlideIndex,
+          focused_slide_index: normalizedRequestContext.focusedSlideIndex,
         }),
       });
 
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        throw new Error(data.detail || 'Failed to start AI stream');
+        throw new Error(extractApiErrorMessage(data, 'Failed to start AI stream'));
       }
 
       await consumeSse(response, (payload) => {
@@ -2449,6 +2926,8 @@ function App() {
             branchId,
             question: nextQueuedMessage.content,
             queuedMessageId: nextQueuedMessage.id,
+            requestContext:
+              nextQueuedMessage.requestContext || buildRequestContextSnapshot({}),
           });
         }, 0);
       } else if (branchId === activeBranchIdRef.current) {
@@ -2473,6 +2952,7 @@ function App() {
       branchId,
       question: nextQueuedMessage.content,
       queuedMessageId: nextQueuedMessage.id,
+      requestContext: nextQueuedMessage.requestContext || buildRequestContextSnapshot({}),
     });
   }
 
@@ -2488,7 +2968,10 @@ function App() {
 
     if (sendingRef.current) {
       if (!editingQueuedMessageId) {
-        enqueueMessageForBranch(activeBranchId, question);
+        enqueueMessageForBranch(activeBranchId, question, {
+          currentSlideIndex,
+          focusedSlideIndex,
+        });
       }
       setInputValue('');
       editingQueuedMessageIdRef.current = null;
@@ -2545,6 +3028,7 @@ function App() {
       branchId: activeBranchId,
       question: queuedMessage.content,
       queuedMessageId,
+      requestContext: queuedMessage.requestContext || buildRequestContextSnapshot({}),
     });
   }
 
@@ -2615,14 +3099,18 @@ function App() {
       return;
     }
 
-    if (event.key === 'Escape' && editingQueuedMessageId) {
+    if (event.key === 'Escape') {
       event.preventDefault();
-      editingQueuedMessageIdRef.current = null;
-      setEditingQueuedMessageId(null);
-      setQueueDraftSnapshot('');
-      window.setTimeout(() => {
-        continueQueuedMessagesIfPossible(activeBranchId);
-      }, 0);
+      if (editingQueuedMessageId) {
+        editingQueuedMessageIdRef.current = null;
+        setEditingQueuedMessageId(null);
+        setQueueDraftSnapshot('');
+        window.setTimeout(() => {
+          continueQueuedMessagesIfPossible(activeBranchId);
+        }, 0);
+      }
+
+      event.currentTarget.blur();
       return;
     }
 
@@ -2760,39 +3248,20 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="topbar-copy">
-          <p className="eyebrow">SlideLecturer</p>
-          <h1>Slide Study Studio</h1>
-          <p className="topbar-subtitle">
-            Upload a deck, scroll a continuous slide viewer, and ask focused questions in real time.
+        <h1>Slide Study Studio</h1>
+        {deck ? (
+          <p className="topbar-deck-name" title={deck.filename}>
+            {deck.filename}
           </p>
-        </div>
-        <div className="topbar-controls">
-          <div className="header-pills">
-            {uploading ? (
-              <span className="status-pill">Uploading</span>
-            ) : deck ? (
-              <span className="status-pill">Deck Loaded</span>
-            ) : (
-              <span className="status-pill muted">Waiting</span>
-            )}
-            {deck ? (
-              <p className="deck-meta">
-                {deck.filename} · {deck.slide_count} slides
-              </p>
-            ) : (
-              <p className="deck-meta muted">No deck loaded</p>
-            )}
-          </div>
-          <input
-            ref={fileInputRef}
-            className="hidden-file-input"
-            type="file"
-            accept=".pdf,.ppt,.pptx"
-            onChange={handleFileInputChange}
-            disabled={uploading || sending}
-          />
-        </div>
+        ) : null}
+        <input
+          ref={fileInputRef}
+          className="hidden-file-input"
+          type="file"
+          accept=".pdf,.ppt,.pptx"
+          onChange={handleFileInputChange}
+          disabled={uploading || sending}
+        />
       </header>
 
       {error ? <p className="global-error">{error}</p> : null}
@@ -2805,8 +3274,20 @@ function App() {
                 <div className="slides-toolbar-main">
                   <button
                     type="button"
+                    className={`ghost-btn ${narrateEnabled ? 'active' : ''}`}
+                    onClick={() => setNarrateEnabled((previous) => !previous)}
+                    disabled={uploading || sending}
+                    aria-pressed={narrateEnabled}
+                    title="Toggle narration generation for the next upload"
+                  >
+                    Narrate: {narrateEnabled ? 'On' : 'Off'}
+                  </button>
+                  <button
+                    type="button"
                     className="ghost-btn"
                     onClick={() => setSlidesVisible(false)}
+                    title="Hide slides (H)"
+                    aria-keyshortcuts="h"
                   >
                     Hide Slides
                   </button>
@@ -2849,6 +3330,7 @@ function App() {
                     placeholder="Search slides and transcripts (/)"
                     disabled={!slides.length}
                     aria-label="Search slides and transcripts"
+                    aria-keyshortcuts="/"
                   />
                   {slideSearchQuery.trim() ? (
                     <button
@@ -2915,10 +3397,20 @@ function App() {
                       const isTranscriptOpen = activeTranscriptSlideIndex === slide.index;
                       const slideTranscript = transcriptsBySlide.get(slide.index) || null;
                       const hasTranscript = Boolean(slideTranscript?.transcript);
+                      const narrationEnabledForDeck = deck?.narrate_enabled !== false;
                       const isBookmarked = bookmarkedSlideSet.has(slide.index);
+                      const isSpeechSelected = activeSpeechSlideIndex === slide.index;
+                      const isSpeechLoading = isSpeechSelected && speechStatus === 'loading';
+                      const isSpeechPlaying = isSpeechSelected && speechStatus === 'playing';
+                      const isSpeechPaused = isSpeechSelected && speechStatus === 'paused';
+                      const isSpeechActive = isSpeechSelected && (isSpeechPlaying || isSpeechPaused);
+                      const canSeekSpeech =
+                        isSpeechSelected && speechStatus !== 'idle' && speechStatus !== 'loading';
                       const transcriptStatus = slideTranscript?.status || 'pending';
                       const transcriptButtonLabel = isTranscriptOpen
                         ? 'Hide'
+                        : !narrationEnabledForDeck
+                          ? 'Narration Off'
                         : hasTranscript
                           ? 'Transcript'
                           : transcriptStatus === 'generating' || transcriptState.status === 'queued'
@@ -2926,6 +3418,17 @@ function App() {
                             : transcriptStatus === 'error'
                               ? 'Unavailable'
                               : 'Pending';
+                      const speechButtonTitle = !narrationEnabledForDeck
+                        ? `Narration is disabled for Slide ${slide.index + 1}`
+                        : !hasTranscript
+                        ? `Transcript is not ready for Slide ${slide.index + 1}`
+                        : isSpeechLoading
+                          ? `Generating narration for Slide ${slide.index + 1}`
+                          : isSpeechPlaying
+                            ? `Pause narration for Slide ${slide.index + 1}`
+                            : isSpeechPaused
+                              ? `Resume narration for Slide ${slide.index + 1}`
+                            : `Play narration for Slide ${slide.index + 1}`;
                       return (
                         <article
                           key={slide.index}
@@ -2937,19 +3440,96 @@ function App() {
                         >
                           <div className="slide-card-header">
                             <p className="slide-label">Slide {slide.index + 1}</p>
-                            <button
-                              type="button"
-                              className={`slide-bookmark-btn ${isBookmarked ? 'active' : ''}`}
+                            <div className="slide-card-actions">
+                              <button
+                                type="button"
+                                className={`slide-bookmark-btn ${isBookmarked ? 'active' : ''}`}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  toggleBookmark(slide.index);
+                                }}
+                                aria-label={`${isBookmarked ? 'Remove' : 'Add'} bookmark for Slide ${slide.index + 1}`}
+                                aria-pressed={isBookmarked}
+                                title={`${isBookmarked ? 'Remove' : 'Add'} bookmark for Slide ${slide.index + 1} (S)`}
+                                aria-keyshortcuts="s"
+                              >
+                                <StarIcon />
+                              </button>
+                              <button
+                                type="button"
+                                className={`slide-transcript-btn ${hasTranscript ? 'ready' : ''}`}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openTranscriptModal(slide.index);
+                                }}
+                                aria-label={`${isTranscriptOpen ? 'Hide' : 'Open'} transcript for Slide ${slide.index + 1}`}
+                                title={`${isTranscriptOpen ? 'Hide' : 'Open'} transcript for Slide ${slide.index + 1} (T)`}
+                                aria-keyshortcuts="t"
+                                disabled={!narrationEnabledForDeck}
+                              >
+                                {transcriptButtonLabel}
+                              </button>
+                              <button
+                                type="button"
+                                className={`slide-speech-btn ${isSpeechActive ? 'active' : ''} ${isSpeechLoading ? 'loading' : ''}`}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  toggleTranscriptSpeech(slide.index, slideTranscript?.transcript);
+                                }}
+                                aria-label={`${isSpeechActive ? 'Pause or resume' : 'Play'} narration for Slide ${slide.index + 1}`}
+                                title={speechButtonTitle}
+                                aria-pressed={isSpeechActive}
+                                disabled={!hasTranscript || !narrationEnabledForDeck}
+                              >
+                                <SpeakerIcon />
+                              </button>
+                            </div>
+                          </div>
+                          {isSpeechSelected ? (
+                            <section
+                              className="slide-speech-row"
                               onClick={(event) => {
                                 event.stopPropagation();
-                                toggleBookmark(slide.index);
                               }}
-                              aria-label={`${isBookmarked ? 'Remove' : 'Add'} bookmark for Slide ${slide.index + 1}`}
-                              aria-pressed={isBookmarked}
                             >
-                              {isBookmarked ? 'Starred' : 'Star'}
-                            </button>
-                          </div>
+                              <div className="slide-speech-row-main">
+                                <div className="slide-speech-row-controls">
+                                  <button
+                                    type="button"
+                                    className="slide-speech-control-btn"
+                                    onClick={() => seekTranscriptSpeechBy(-15)}
+                                    disabled={!canSeekSpeech}
+                                    aria-label={`Jump back 15 seconds for Slide ${slide.index + 1} narration`}
+                                  >
+                                    -15s
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="slide-speech-control-btn primary"
+                                    onClick={() => toggleTranscriptSpeech(slide.index, slideTranscript?.transcript)}
+                                    aria-label={`${isSpeechPlaying ? 'Pause' : 'Play'} Slide ${slide.index + 1} narration`}
+                                  >
+                                    {isSpeechPlaying ? 'Pause' : isSpeechLoading ? 'Loading' : 'Play'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="slide-speech-control-btn"
+                                    onClick={() => seekTranscriptSpeechBy(15)}
+                                    disabled={!canSeekSpeech}
+                                    aria-label={`Jump forward 15 seconds for Slide ${slide.index + 1} narration`}
+                                  >
+                                    +15s
+                                  </button>
+                                </div>
+                                <p className="slide-speech-row-time">
+                                  {formatPlaybackClock(speechCurrentTimeSeconds)} / {formatPlaybackClock(speechDurationSeconds)}
+                                </p>
+                              </div>
+                              {speechIsBuffering ? (
+                                <p className="slide-speech-row-state">Buffering narration…</p>
+                              ) : null}
+                            </section>
+                          ) : null}
                           {isTranscriptOpen ? (
                             <section
                               className="slide-transcript-row"
@@ -2961,6 +3541,10 @@ function App() {
                               <div className="slide-transcript-row-body">
                                 {hasTranscript ? (
                                   <p className="slide-transcript-row-text">{slideTranscript.transcript}</p>
+                                ) : !narrationEnabledForDeck ? (
+                                  <p className="slide-transcript-row-state">
+                                    Narration is disabled for this deck.
+                                  </p>
                                 ) : transcriptStatus === 'error' ? (
                                   <p className="slide-transcript-row-state error">
                                     {slideTranscript?.error || 'Transcript generation failed for this slide.'}
@@ -2978,17 +3562,6 @@ function App() {
                             </section>
                           ) : null}
                           <div className="slide-image-wrap">
-                            <button
-                              type="button"
-                              className={`slide-transcript-btn ${hasTranscript ? 'ready' : ''}`}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                openTranscriptModal(slide.index);
-                              }}
-                              aria-label={`${isTranscriptOpen ? 'Hide' : 'Open'} transcript for Slide ${slide.index + 1}`}
-                            >
-                              {transcriptButtonLabel}
-                            </button>
                             <img
                               src={slideImageUrl(slide.index)}
                               alt={`Slide ${slide.index + 1}`}
@@ -3046,6 +3619,11 @@ function App() {
                 ) : (
                   <p>No slides</p>
                 )}
+                {slides.length ? (
+                  <p className="shortcut-hint">
+                    Shortcuts: / search · S star current slide · T transcript · H hide/show slides · Q ask AI
+                  </p>
+                ) : null}
               </footer>
             </section>
 
@@ -3071,7 +3649,13 @@ function App() {
             {slidesVisible ? (
               <h2>Ask AI</h2>
             ) : (
-              <button type="button" className="ghost-btn" onClick={() => setSlidesVisible(true)}>
+              <button
+                type="button"
+                className="ghost-btn"
+                onClick={() => setSlidesVisible(true)}
+                title="Show slides (H)"
+                aria-keyshortcuts="h"
+              >
                 Show Slides
               </button>
             )}
@@ -3081,19 +3665,23 @@ function App() {
               </p>
               <button
                 type="button"
-                className="ghost-btn"
+                className="ghost-btn icon-btn"
                 onClick={() => setIsBranchMapOpen(true)}
                 disabled={!branchTree.hasNodes}
+                aria-label="View conversation branches"
+                title="View branches"
               >
-                View Branches
+                <BranchTreeIcon />
               </button>
               <button
                 type="button"
-                className="ghost-btn"
+                className="ghost-btn icon-btn"
                 onClick={clearChat}
                 disabled={!hasDeck || sending || clearingChat}
+                aria-label={clearingChat ? 'Clearing chat' : 'Clear chat'}
+                title={clearingChat ? 'Clearing chat' : 'Clear chat'}
               >
-                {clearingChat ? 'Clearing...' : 'Clear Chat'}
+                <ClearChatIcon />
               </button>
             </div>
           </header>
@@ -3163,10 +3751,20 @@ function App() {
                       ) : null}
                       <button
                         type="button"
-                        className="message-action-btn"
+                        className="message-action-btn icon-only"
                         onClick={() => focusQueuedMessageForEditing(queuedMessage.id)}
+                        aria-label={
+                          editingQueuedMessageId === queuedMessage.id
+                            ? 'Editing queued message'
+                            : 'Edit queued message'
+                        }
+                        title={
+                          editingQueuedMessageId === queuedMessage.id
+                            ? 'Editing queued message'
+                            : 'Edit'
+                        }
                       >
-                        {editingQueuedMessageId === queuedMessage.id ? 'Editing' : 'Edit'}
+                        <EditIcon />
                       </button>
                       <button
                         type="button"
@@ -3192,16 +3790,23 @@ function App() {
               disabled={!hasDeck || clearingChat}
               rows={Math.min(5, Math.max(1, inputValue.split('\n').length))}
               aria-label="Message composer"
+              aria-keyshortcuts="q"
             />
-            <button type="submit" disabled={!hasDeck || sending || clearingChat || !inputValue.trim()}>
-              Send
+            <button
+              type="submit"
+              className="chat-send-btn"
+              disabled={!hasDeck || sending || clearingChat || !inputValue.trim()}
+              aria-label="Send message"
+              title="Send"
+            >
+              <SendIcon />
             </button>
             <p className="composer-hint">
               {sending
-                ? 'AI is still responding. Press Enter to queue this branch message.'
+                ? 'AI is still responding. Press Enter to queue this branch message. Shortcuts: /, S, T, H, Q.'
                 : editingQueuedMessageId
-                  ? 'Editing queued message. Press Esc to leave queue edit mode.'
-                  : 'Press Enter to send. Shift+Enter adds a new line. Use ↑/↓ to browse queued prompts.'}
+                  ? 'Editing queued message. Press Esc to leave queue edit mode. Shortcuts: /, S, T, H, Q.'
+                  : 'Press Enter to send. Shift+Enter adds a new line. Use ↑/↓ to browse queued prompts. Shortcuts: /, S, T, H, Q.'}
             </p>
           </form>
         </section>

@@ -45,6 +45,13 @@ class Settings:
     """Environment-backed application settings."""
 
     anthropic_api_key: str | None
+    elevenlabs_api_key: str | None
+    elevenlabs_voice_id: str | None
+    elevenlabs_voice_name: str
+    elevenlabs_model_id: str
+    elevenlabs_output_format: str
+    elevenlabs_base_url: str
+    elevenlabs_timeout_seconds: int
     storage_dir: Path
     max_pdf_pages: int
     model_name: str
@@ -72,6 +79,13 @@ def get_settings() -> Settings:
 
     return Settings(
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY"),
+        elevenlabs_voice_id=os.getenv("ELEVENLABS_VOICE_ID"),
+        elevenlabs_voice_name=os.getenv("ELEVENLABS_VOICE_NAME", "Rachel"),
+        elevenlabs_model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"),
+        elevenlabs_output_format=os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
+        elevenlabs_base_url=os.getenv("ELEVENLABS_BASE_URL", "https://api.elevenlabs.io").rstrip("/"),
+        elevenlabs_timeout_seconds=int(os.getenv("ELEVENLABS_TIMEOUT_SECONDS", "45")),
         storage_dir=storage_dir,
         max_pdf_pages=int(os.getenv("MAX_PDF_PAGES", "100")),
         model_name=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),

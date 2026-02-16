@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -36,8 +38,10 @@ class DeckRecord:
     source_path: Path
     pdf_path: Path
     slide_count: int
+    narrate_enabled: bool
     slide_text: list[str]
-    transcript_status: Literal["queued", "generating", "completed", "error"] = "queued"
+    transcript_cache_key: str | None = None
+    transcript_status: Literal["queued", "generating", "completed", "error", "disabled"] = "queued"
     transcript_error: str | None = None
     transcript_active_slide_index: int | None = None
     transcripts: list[str | None] = field(default_factory=list)
@@ -61,10 +65,12 @@ class DeckService:
     def __init__(self, storage_dir: Path):
         self.storage_dir = storage_dir
         self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.transcript_cache_dir = self.storage_dir / "transcript_cache"
+        self.transcript_cache_dir.mkdir(parents=True, exist_ok=True)
         self._decks: dict[str, DeckRecord] = {}
         self._lock = threading.RLock()
 
-    def create_deck(self, filename: str, content_stream: BinaryIO) -> DeckRecord:
+    def create_deck(self, filename: str, content_stream: BinaryIO, narrate_enabled: bool = True) -> DeckRecord:
         suffix = Path(filename).suffix.lower()
         if suffix not in SUPPORTED_EXTENSIONS:
             allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
@@ -86,14 +92,26 @@ class DeckService:
                 pdf_path = self._convert_powerpoint_to_pdf(source_path, deck_dir)
 
             slide_text = self._extract_slide_text(pdf_path)
+            transcript_cache_key = self._build_transcript_cache_key(slide_text) if narrate_enabled else None
+            cached_transcripts = None
+            has_cached_transcripts = False
+            if narrate_enabled and transcript_cache_key:
+                cached_transcripts = self._load_cached_transcripts(
+                    transcript_cache_key,
+                    expected_slide_count=len(slide_text),
+                )
+                has_cached_transcripts = cached_transcripts is not None and len(cached_transcripts) == len(slide_text)
             record = DeckRecord(
                 deck_id=deck_id,
                 filename=filename,
                 source_path=source_path,
                 pdf_path=pdf_path,
                 slide_count=len(slide_text),
+                narrate_enabled=narrate_enabled,
                 slide_text=slide_text,
-                transcripts=[None] * len(slide_text),
+                transcript_cache_key=transcript_cache_key,
+                transcript_status="disabled" if not narrate_enabled else ("completed" if has_cached_transcripts else "queued"),
+                transcripts=cached_transcripts if cached_transcripts is not None else [None] * len(slide_text),
                 transcript_slide_errors=[None] * len(slide_text),
             )
 
@@ -133,9 +151,22 @@ class DeckService:
             raise IndexError(f"Slide index out of range: {slide_index}")
         return deck.slide_text[slide_index]
 
+    def get_slide_transcript(self, deck_id: str, slide_index: int) -> str | None:
+        deck = self.get_deck(deck_id)
+        if slide_index < 0 or slide_index >= deck.slide_count:
+            raise IndexError(f"Slide index out of range: {slide_index}")
+        with deck.lock:
+            return deck.transcripts[slide_index]
+
     def mark_transcript_generation_started(self, deck_id: str) -> bool:
         deck = self.get_deck(deck_id)
         with deck.lock:
+            if not deck.narrate_enabled:
+                deck.transcript_status = "disabled"
+                deck.transcript_error = None
+                deck.transcript_active_slide_index = None
+                return False
+
             if deck.transcript_status == "generating":
                 return False
 
@@ -143,6 +174,17 @@ class DeckService:
                 deck.transcript_status = "completed"
                 deck.transcript_error = None
                 deck.transcript_active_slide_index = None
+                return False
+
+            has_complete_transcripts = (
+                len(deck.transcripts) == deck.slide_count
+                and all(isinstance(transcript, str) and transcript.strip() for transcript in deck.transcripts)
+            )
+            if has_complete_transcripts:
+                deck.transcript_status = "completed"
+                deck.transcript_error = None
+                deck.transcript_active_slide_index = None
+                deck.transcript_slide_errors = [None] * deck.slide_count
                 return False
 
             deck.transcript_status = "generating"
@@ -190,6 +232,11 @@ class DeckService:
             deck.transcript_status = "completed"
             deck.transcript_error = None
             deck.transcript_active_slide_index = None
+            cache_key = deck.transcript_cache_key
+            transcripts = list(deck.transcripts)
+
+        if cache_key:
+            self._persist_cached_transcripts(cache_key, transcripts)
 
     def mark_transcript_generation_error(self, deck_id: str, error: str) -> None:
         deck = self.get_deck(deck_id)
@@ -232,6 +279,7 @@ class DeckService:
 
         return {
             "deck_id": deck.deck_id,
+            "narrate_enabled": deck.narrate_enabled,
             "status": generation_status,
             "total_slides": deck.slide_count,
             "completed_slides": completed_slides,
@@ -268,6 +316,85 @@ class DeckService:
     def _extract_slide_text(self, pdf_path: Path) -> list[str]:
         with fitz.open(pdf_path) as doc:
             return [page.get_text() for page in doc]
+
+    def _build_transcript_cache_key(self, slide_text: list[str]) -> str:
+        digest = hashlib.sha256()
+        digest.update(str(len(slide_text)).encode("utf-8"))
+        digest.update(b"\n")
+        for index, text in enumerate(slide_text):
+            normalized_text = " ".join(str(text or "").split())
+            digest.update(str(index).encode("utf-8"))
+            digest.update(b"\n")
+            digest.update(normalized_text.encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def _transcript_cache_path(self, cache_key: str) -> Path:
+        safe_cache_key = cache_key.strip().lower()
+        return self.transcript_cache_dir / f"{safe_cache_key}.json"
+
+    def _load_cached_transcripts(self, cache_key: str, expected_slide_count: int) -> list[str] | None:
+        path = self._transcript_cache_path(cache_key)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        slide_count = payload.get("slide_count")
+        transcripts = payload.get("transcripts")
+
+        if not isinstance(slide_count, int) or slide_count != expected_slide_count:
+            return None
+        if not isinstance(transcripts, list) or len(transcripts) != expected_slide_count:
+            return None
+
+        normalized_transcripts: list[str] = []
+        for entry in transcripts:
+            if not isinstance(entry, str):
+                return None
+            normalized = " ".join(entry.split())
+            if not normalized:
+                return None
+            normalized_transcripts.append(normalized)
+
+        return normalized_transcripts
+
+    def _persist_cached_transcripts(self, cache_key: str, transcripts: list[str | None]) -> None:
+        if not cache_key:
+            return
+
+        normalized_transcripts: list[str] = []
+        for entry in transcripts:
+            if not isinstance(entry, str):
+                return
+            normalized = " ".join(entry.split())
+            if not normalized:
+                return
+            normalized_transcripts.append(normalized)
+
+        payload = {
+            "version": 1,
+            "slide_count": len(normalized_transcripts),
+            "transcripts": normalized_transcripts,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        final_path = self._transcript_cache_path(cache_key)
+        temp_path = final_path.with_name(f".{final_path.name}.{uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(final_path)
+        except OSError:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
 
     def _convert_powerpoint_to_pdf(self, source_path: Path, deck_dir: Path) -> Path:
         soffice = self._find_libreoffice()

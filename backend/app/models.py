@@ -13,6 +13,7 @@ class DeckUploadResponse(BaseModel):
     filename: str
     slide_count: int
     created_at: datetime
+    narrate_enabled: bool
 
 
 class SlideSummary(BaseModel):
@@ -31,9 +32,10 @@ class DeckInfoResponse(BaseModel):
     filename: str
     slide_count: int
     created_at: datetime
+    narrate_enabled: bool
 
 
-TranscriptGenerationStatus = Literal["queued", "generating", "completed", "error"]
+TranscriptGenerationStatus = Literal["queued", "generating", "completed", "error", "disabled"]
 TranscriptSlideStatus = Literal["pending", "generating", "completed", "error"]
 
 
@@ -46,6 +48,7 @@ class SlideTranscript(BaseModel):
 
 class DeckTranscriptsResponse(BaseModel):
     deck_id: str
+    narrate_enabled: bool
     status: TranscriptGenerationStatus
     total_slides: int
     completed_slides: int

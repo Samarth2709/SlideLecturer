@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import base64
 import threading
+from datetime import datetime, timezone
 from typing import Generator
 
 from anthropic import Anthropic
 
 from ..config import settings
-from ..prompts import SYSTEM_PROMPT, build_focus_prompt, build_transcript_prompt, build_user_prompt
-from .deck_service import DeckNotFoundError, DeckRecord, DeckService
-
-TRANSCRIPT_SYSTEM_PROMPT = (
-    "You are an expert university professor. Generate spoken lecture transcripts for slides. "
-    "Always return plain text with no markdown."
+from ..prompts import (
+    SYSTEM_PROMPT,
+    TRANSCRIPT_SYSTEM_PROMPT,
+    build_focus_prompt,
+    build_transcript_prompt,
+    build_user_prompt,
 )
+from .deck_service import DeckNotFoundError, DeckRecord, DeckService
 
 
 class AIService:
@@ -24,6 +26,9 @@ class AIService:
     def __init__(self, deck_service: DeckService):
         self.deck_service = deck_service
         self.client = Anthropic(api_key=settings.anthropic_api_key) if settings.anthropic_api_key else None
+        self._conversation_log_lock = threading.RLock()
+        self._conversation_log_path = settings.storage_dir / "logs" / "ai_conversations.log"
+        self._conversation_log_path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
     def is_available(self) -> bool:
@@ -50,7 +55,6 @@ class AIService:
         self,
         deck: DeckRecord,
         question: str,
-        current_slide_index: int | None,
         focused_slide_index: int | None,
         history: list[dict[str, str]] | None = None,
     ) -> Generator[str, None, None]:
@@ -71,15 +75,24 @@ class AIService:
                 for entry in history[-20:]
                 if entry.get("role") in {"user", "assistant"} and entry.get("content")
             ]
-            is_first_message = len(normalized_history) == 0
+        else:
+            with deck.lock:
+                normalized_history = list(deck.conversation_history[-20:])
+
+        messages = self._build_history_messages(normalized_history)
+        user_content: list[dict] = []
+
+        # Keep deck context as a single prior conversation message when history exists.
+        if history is not None:
+            if not messages:
+                user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
+            elif not self._attach_pdf_to_first_user_message(messages, deck.get_pdf_base64()):
+                user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
         else:
             with deck.lock:
                 is_first_message = deck.is_first_message
-                normalized_history = list(deck.conversation_history[-20:])
-
-        user_content: list[dict] = []
-        if is_first_message:
-            user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
+            if is_first_message:
+                user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
 
         prompt_text = build_user_prompt(question)
         if focused_slide_index is not None:
@@ -87,12 +100,20 @@ class AIService:
             focus_png = self.deck_service.render_slide_png(deck.deck_id, focused_slide_index, scale=2.0)
             user_content.append(self._build_image_block(base64.b64encode(focus_png).decode("utf-8")))
             prompt_text = build_focus_prompt(question, slide_number)
-        elif current_slide_index is not None:
-            prompt_text = build_user_prompt(f"(Current slide: {current_slide_index + 1})\n\n{question}")
 
         user_content.append(self._build_text_block(prompt_text))
 
-        messages = normalized_history + [{"role": "user", "content": user_content}]
+        messages = messages + [{"role": "user", "content": user_content}]
+        conversation_started = len(normalized_history) == 0
+        self._log_provider_request(
+            deck=deck,
+            model_name=settings.model_name,
+            system_prompt=SYSTEM_PROMPT,
+            system_prompt_logged=conversation_started,
+            messages=messages,
+            focused_slide_index=focused_slide_index,
+            history_turns=len(normalized_history),
+        )
 
         full_response = ""
         try:
@@ -106,8 +127,11 @@ class AIService:
                     full_response += text
                     yield text
         except Exception as exc:  # noqa: BLE001
+            self._log_provider_error(deck.deck_id, str(exc))
             yield f"[Error: {exc}]"
             return
+
+        self._log_provider_response(deck.deck_id, full_response)
 
         if history is None:
             with deck.lock:
@@ -275,3 +299,147 @@ class AIService:
             "type": "text",
             "text": text,
         }
+
+    @classmethod
+    def _build_history_messages(cls, history: list[dict[str, str]]) -> list[dict]:
+        messages: list[dict] = []
+        for entry in history:
+            role = str(entry.get("role") or "").strip()
+            content = str(entry.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            messages.append(
+                {
+                    "role": role,
+                    "content": [cls._build_text_block(content)],
+                }
+            )
+        return messages
+
+    def _attach_pdf_to_first_user_message(self, messages: list[dict], pdf_base64: str) -> bool:
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+
+            content = message.get("content")
+            if not isinstance(content, list):
+                content = [self._build_text_block(str(content or ""))]
+
+            has_document_block = any(
+                isinstance(block, dict) and block.get("type") == "document" for block in content
+            )
+            if not has_document_block:
+                content.insert(0, self._build_pdf_document_block(pdf_base64, with_cache=True))
+
+            message["content"] = content
+            return True
+        return False
+
+    def _log_provider_request(
+        self,
+        deck: DeckRecord,
+        model_name: str,
+        system_prompt: str,
+        system_prompt_logged: bool,
+        messages: list[dict],
+        focused_slide_index: int | None,
+        history_turns: int,
+    ) -> None:
+        focus_mode_enabled = focused_slide_index is not None
+        attachment_count = self._count_attachments(messages)
+
+        lines = [
+            f"[{self._utc_timestamp()}] OUTBOUND -> anthropic.messages.stream",
+            f"deck_id={deck.deck_id} filename={deck.filename!r} model={model_name}",
+            f"focus_mode={focus_mode_enabled} focused_slide_index={focused_slide_index}",
+            f"history_turns={history_turns} attachments={attachment_count}",
+        ]
+
+        if system_prompt_logged:
+            lines.extend(
+                [
+                    "SYSTEM PROMPT:",
+                    system_prompt,
+                ]
+            )
+
+        lines.append("MESSAGES SENT:")
+        for idx, message in enumerate(messages, start=1):
+            lines.extend(self._format_message_for_log(message, idx))
+
+        self._append_conversation_log(lines)
+
+    def _log_provider_response(self, deck_id: str, response_text: str) -> None:
+        lines = [
+            f"[{self._utc_timestamp()}] INBOUND <- anthropic.messages.stream",
+            f"deck_id={deck_id}",
+            "ASSISTANT RESPONSE:",
+            response_text,
+            "--------------------------------------------------------------------------------",
+        ]
+        self._append_conversation_log(lines, trailing_newlines=3)
+
+    def _log_provider_error(self, deck_id: str, error_text: str) -> None:
+        lines = [
+            f"[{self._utc_timestamp()}] INBOUND <- anthropic.messages.stream",
+            f"deck_id={deck_id}",
+            f"ERROR: {error_text}",
+        ]
+        self._append_conversation_log(lines, trailing_newlines=3)
+
+    def _append_conversation_log(self, lines: list[str], trailing_newlines: int = 1) -> None:
+        payload = "\n".join(lines) + ("\n" * trailing_newlines)
+        with self._conversation_log_lock:
+            with self._conversation_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
+
+    def _format_message_for_log(self, message: dict, index: int) -> list[str]:
+        role = message.get("role", "unknown")
+        output = [f"- message[{index}] role={role}"]
+        content = message.get("content")
+
+        if not isinstance(content, list):
+            output.append(f"  text={str(content or '')}")
+            return output
+
+        for block_index, block in enumerate(content, start=1):
+            if not isinstance(block, dict):
+                output.append(f"  block[{block_index}] raw={str(block)}")
+                continue
+
+            block_type = str(block.get("type") or "unknown")
+            if block_type == "text":
+                output.append(f"  block[{block_index}] type=text")
+                output.append(str(block.get("text") or ""))
+                continue
+
+            source = block.get("source") if isinstance(block.get("source"), dict) else {}
+            media_type = source.get("media_type", "unknown")
+            data = source.get("data")
+            base64_chars = len(data) if isinstance(data, str) else 0
+            cache_control = block.get("cache_control")
+            output.append(
+                f"  block[{block_index}] type={block_type} media_type={media_type} "
+                f"base64_chars={base64_chars} cache_control={cache_control}"
+            )
+
+        return output
+
+    @staticmethod
+    def _count_attachments(messages: list[dict]) -> int:
+        attachment_count = 0
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in {"document", "image"}:
+                    attachment_count += 1
+        return attachment_count
+
+    @staticmethod
+    def _utc_timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat()

@@ -315,6 +315,7 @@ function extractApiErrorMessage(payload, fallback) {
 }
 
 function normalizeContextIndex(value) {
+  if (value === null || value === undefined) return null;
   const numeric = Number(value);
   return Number.isInteger(numeric) && numeric >= 0 ? numeric : null;
 }

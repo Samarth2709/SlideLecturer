@@ -469,6 +469,7 @@ def stream_chat(deck_id: str, body: ChatStreamRequest) -> StreamingResponse:
             question=body.question,
             focused_slide_index=body.focused_slide_index,
             history=[entry.model_dump() for entry in body.history],
+            additional_context=body.additional_context,
         ):
             if chunk.startswith("[Error:"):
                 error_message = chunk.removeprefix("[Error:").removesuffix("]").strip()

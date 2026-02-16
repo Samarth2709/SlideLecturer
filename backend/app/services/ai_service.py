@@ -57,6 +57,7 @@ class AIService:
         question: str,
         focused_slide_index: int | None,
         history: list[dict[str, str]] | None = None,
+        additional_context: str | None = None,
     ) -> Generator[str, None, None]:
         if not self.is_available:
             yield "[Error: AI service not available. Set ANTHROPIC_API_KEY.]"
@@ -93,6 +94,11 @@ class AIService:
                 is_first_message = deck.is_first_message
             if is_first_message:
                 user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
+
+        if additional_context:
+            user_content.append(self._build_text_block(
+                f"The student has provided the following additional context about these slides:\n\n{additional_context}"
+            ))
 
         prompt_text = build_user_prompt(question)
         if focused_slide_index is not None:

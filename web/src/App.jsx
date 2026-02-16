@@ -2,6 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import { visit } from 'unist-util-visit';
+
+function remarkCodeBlockDefault() {
+  return (tree) => {
+    visit(tree, 'code', (node) => {
+      if (!node.lang) {
+        node.lang = 'plaintext';
+      }
+    });
+  };
+}
 
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '');
 
@@ -24,6 +35,8 @@ const TRANSCRIPT_POLL_INTERVAL_MS = 1800;
 const DECK_PREFERENCES_STORAGE_PREFIX = 'slidelecturer.deckPreferences.v1';
 const SEARCH_SNIPPET_MAX_CHARS = 180;
 const MAX_CHAT_HISTORY_MESSAGES = 40;
+const MAX_CONTEXT_TOTAL_LENGTH = 50000;
+const CONTEXT_SEPARATOR = '\n\n---\n\n';
 
 const EMPTY_TRANSCRIPT_STATE = Object.freeze({
   status: 'queued',
@@ -710,6 +723,25 @@ function SendIcon({ className = 'icon' }) {
   );
 }
 
+function NoteIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M14 3H6a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2V9l-6-6z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M14 3v6h6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+      <path d="M8 13h8M8 17h5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function DeleteIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M3 6h18M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M5 6l1 14a2 2 0 002 2h8a2 2 0 002-2l1-14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function MessageBubble({
   message,
   isEditing,
@@ -727,14 +759,16 @@ function MessageBubble({
   const canSaveEdit = editDraft.trim().length > 0 && editDraft !== message.content;
 
   const markdownComponents = {
-    code({ inline, className, children, ...props }) {
+    code({ className, children, ...props }) {
       const rawCode = String(children).replace(/\n$/, '');
       const languageMatch = /language-([a-zA-Z0-9_+-]+)/.exec(className || '');
       const hintedLanguage = languageMatch ? languageMatch[1] : '';
       const detected = detectLanguageFromCode(rawCode, hintedLanguage);
       const language = detected.language;
 
-      if (!inline) {
+      const isBlock = /language-/.test(className || '');
+
+      if (isBlock) {
         const displayLanguage = language === 'plaintext' ? '' : language;
         return (
           <div className="ai-code-block">
@@ -855,7 +889,7 @@ function MessageBubble({
             rows={Math.min(14, Math.max(4, editDraft.split('\n').length + 1))}
           />
         ) : message.role === 'assistant' ? (
-          <ReactMarkdown components={markdownComponents}>{normalizedAssistantMarkdown}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkCodeBlockDefault]} components={markdownComponents}>{normalizedAssistantMarkdown}</ReactMarkdown>
         ) : (
           <p>{message.content}</p>
         )}
@@ -956,6 +990,10 @@ function App() {
   const [splitRatio, setSplitRatio] = useState(() => loadInitialSplitRatio());
   const [isResizingSplit, setIsResizingSplit] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
+  const [contextEntries, setContextEntries] = useState([]);
+  const [contextDraft, setContextDraft] = useState('');
+  const [editingContextIndex, setEditingContextIndex] = useState(null);
+  const [isContextModalOpen, setIsContextModalOpen] = useState(false);
 
   const workspaceRef = useRef(null);
   const slideScrollRef = useRef(null);
@@ -963,7 +1001,6 @@ function App() {
   const inputRef = useRef(null);
   const slideSearchInputRef = useRef(null);
   const fileInputRef = useRef(null);
-  const messagesEndRef = useRef(null);
   const currentSlideIndexRef = useRef(0);
   const dragDepthRef = useRef(0);
   const copyResetTimerRef = useRef(null);
@@ -976,6 +1013,7 @@ function App() {
   const sendingRef = useRef(sending);
   const speechAudioRef = useRef(null);
   const speechRequestIdRef = useRef(0);
+  const contextSentValueRef = useRef(null);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
   const messages = activeBranch?.messages || [WELCOME_MESSAGE];
@@ -1630,11 +1668,6 @@ function App() {
     currentSlideIndexRef.current = currentSlideIndex;
   }, [currentSlideIndex]);
 
-  useEffect(() => {
-    if (messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
-    }
-  }, [messages]);
 
   useEffect(() => {
     if (!editingMessageId) {
@@ -2056,6 +2089,8 @@ function App() {
       resetBranches();
       resetTranscriptState(payload.slide_count || 0);
       setInputValue('');
+      setContextEntries([]);
+      contextSentValueRef.current = null;
       await fetchSlides(payload.deck_id);
     } catch (uploadError) {
       setError(normalizeError(uploadError, 'Failed to upload deck'));
@@ -2741,12 +2776,72 @@ function App() {
       setEditingMessageId(null);
       setMessageDraft('');
       setCopiedMessageId(null);
+      contextSentValueRef.current = null;
     } catch (clearError) {
       setError(normalizeError(clearError, 'Failed to clear chat'));
     } finally {
       clearingChatRef.current = false;
       setClearingChat(false);
     }
+  }
+
+  function openContextModal() {
+    setContextDraft('');
+    setEditingContextIndex(null);
+    setIsContextModalOpen(true);
+  }
+
+  function closeContextModal() {
+    setIsContextModalOpen(false);
+    setEditingContextIndex(null);
+    setContextDraft('');
+  }
+
+  function getJoinedContextLength(entries) {
+    if (!entries.length) return 0;
+    return entries.join(CONTEXT_SEPARATOR).length;
+  }
+
+  function addContextEntry() {
+    const trimmed = contextDraft.trim();
+    if (!trimmed) return;
+    const prospective = editingContextIndex !== null
+      ? contextEntries.map((entry, i) => (i === editingContextIndex ? trimmed : entry))
+      : [...contextEntries, trimmed];
+    if (getJoinedContextLength(prospective) > MAX_CONTEXT_TOTAL_LENGTH) {
+      return;
+    }
+    setContextEntries(prospective);
+    if (editingContextIndex !== null) {
+      setEditingContextIndex(null);
+    }
+    setContextDraft('');
+  }
+
+  function startEditingContextEntry(index) {
+    setEditingContextIndex(index);
+    setContextDraft(contextEntries[index]);
+  }
+
+  function cancelEditingContextEntry() {
+    setEditingContextIndex(null);
+    setContextDraft('');
+  }
+
+  function deleteContextEntry(index) {
+    setContextEntries((prev) => prev.filter((_, i) => i !== index));
+    if (editingContextIndex === index) {
+      setEditingContextIndex(null);
+      setContextDraft('');
+    } else if (editingContextIndex !== null && editingContextIndex > index) {
+      setEditingContextIndex((prev) => prev - 1);
+    }
+  }
+
+  function deleteAllContextEntries() {
+    setContextEntries([]);
+    setEditingContextIndex(null);
+    setContextDraft('');
   }
 
   function startEditingMessage(messageId) {
@@ -2820,6 +2915,8 @@ function App() {
       return false;
     }
 
+    const contextSnapshot = [...contextEntries];
+
     if (queuedMessageId) {
       removeQueuedMessage(branchId, queuedMessageId);
     }
@@ -2874,6 +2971,11 @@ function App() {
           history: branchHistory,
           current_slide_index: normalizedRequestContext.currentSlideIndex,
           focused_slide_index: normalizedRequestContext.focusedSlideIndex,
+          additional_context: (() => {
+            if (!contextSnapshot.length) return null;
+            const joined = contextSnapshot.join(CONTEXT_SEPARATOR);
+            return joined !== contextSentValueRef.current ? joined : null;
+          })(),
         }),
       });
 
@@ -2905,6 +3007,13 @@ function App() {
           );
         }
       });
+
+      if (contextSnapshot.length) {
+        const joined = contextSnapshot.join(CONTEXT_SEPARATOR);
+        if (joined !== contextSentValueRef.current) {
+          contextSentValueRef.current = joined;
+        }
+      }
     } catch (streamError) {
       const message = normalizeError(streamError, 'Failed to stream AI response');
       updateBranchMessages(branchId, (previous) =>
@@ -3676,6 +3785,16 @@ function App() {
               </button>
               <button
                 type="button"
+                className={`ghost-btn icon-btn${contextEntries.length ? ' has-context' : ''}`}
+                onClick={openContextModal}
+                disabled={!hasDeck}
+                aria-label={contextEntries.length ? `Additional context (${contextEntries.length})` : 'Add additional context'}
+                title={contextEntries.length ? `Additional context (${contextEntries.length})` : 'Add additional context'}
+              >
+                <NoteIcon />
+              </button>
+              <button
+                type="button"
                 className="ghost-btn icon-btn"
                 onClick={clearChat}
                 disabled={!hasDeck || sending || clearingChat}
@@ -3705,7 +3824,6 @@ function App() {
               />
             ))}
             {sending ? <p className="typing-indicator">AI is typing...</p> : null}
-            <div ref={messagesEndRef} />
           </div>
 
           {queuedMessages.length ? (
@@ -3848,6 +3966,137 @@ function App() {
               ) : (
                 <p className="branch-tree-empty">No branches yet.</p>
               )}
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {isContextModalOpen ? (
+        <div
+          className="context-modal-backdrop"
+          role="presentation"
+          onClick={closeContextModal}
+        >
+          <section
+            className="context-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Additional context"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="context-modal-header">
+              <div>
+                <h3>Additional Context</h3>
+                <p>{contextEntries.length ? `${contextEntries.length} entr${contextEntries.length === 1 ? 'y' : 'ies'}` : 'No entries yet'}</p>
+              </div>
+              <div className="context-modal-header-actions">
+                {contextEntries.length > 0 ? (
+                  <button
+                    type="button"
+                    className="ghost-btn danger-btn"
+                    onClick={deleteAllContextEntries}
+                  >
+                    Clear All
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  onClick={closeContextModal}
+                >
+                  Close
+                </button>
+              </div>
+            </header>
+
+            <div className="context-modal-body">
+              {contextEntries.length > 0 ? (
+                <ul className="context-entry-list">
+                  {contextEntries.map((entry, index) => (
+                    <li key={index} className="context-entry-item">
+                      <div className="context-entry-text">{entry}</div>
+                      <div className="context-entry-actions">
+                        <button
+                          type="button"
+                          className="message-action-btn"
+                          onClick={() => startEditingContextEntry(index)}
+                          title="Edit"
+                        >
+                          <EditIcon />
+                        </button>
+                        <button
+                          type="button"
+                          className="message-action-btn"
+                          onClick={() => deleteContextEntry(index)}
+                          title="Delete"
+                        >
+                          <DeleteIcon />
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+
+              <div className="context-entry-form">
+                {(() => {
+                  const trimmed = contextDraft.trim();
+                  const prospective = !trimmed ? contextEntries
+                    : editingContextIndex !== null
+                      ? contextEntries.map((e, i) => (i === editingContextIndex ? trimmed : e))
+                      : [...contextEntries, trimmed];
+                  const totalLength = getJoinedContextLength(prospective);
+                  const overLimit = trimmed && totalLength > MAX_CONTEXT_TOTAL_LENGTH;
+                  const currentLength = getJoinedContextLength(contextEntries);
+                  return (
+                    <>
+                      <textarea
+                        className="context-modal-textarea"
+                        value={contextDraft}
+                        onChange={(event) => setContextDraft(event.target.value)}
+                        placeholder="Enter additional context (e.g., course notes, syllabus details, key topics to focus on...)"
+                        rows={4}
+                        autoFocus
+                      />
+                      <div className="context-entry-form-actions">
+                        {currentLength > 0 ? (
+                          <span className={`context-char-count${overLimit ? ' over-limit' : ''}`}>
+                            {currentLength.toLocaleString()} / {MAX_CONTEXT_TOTAL_LENGTH.toLocaleString()}
+                          </span>
+                        ) : null}
+                        {editingContextIndex !== null ? (
+                          <>
+                            <button
+                              type="button"
+                              className="ghost-btn"
+                              onClick={cancelEditingContextEntry}
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              className="ghost-btn primary-btn"
+                              onClick={addContextEntry}
+                              disabled={!trimmed || overLimit}
+                            >
+                              Save
+                            </button>
+                          </>
+                        ) : (
+                          <button
+                            type="button"
+                            className="ghost-btn primary-btn"
+                            onClick={addContextEntry}
+                            disabled={!trimmed || overLimit}
+                          >
+                            Add
+                          </button>
+                        )}
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
             </div>
           </section>
         </div>

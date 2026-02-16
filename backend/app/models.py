@@ -66,6 +66,7 @@ class ChatStreamRequest(BaseModel):
     history: list[ChatHistoryTurn] = Field(default_factory=list, max_length=40)
     current_slide_index: int | None = Field(default=None, ge=0)
     focused_slide_index: int | None = Field(default=None, ge=0)
+    additional_context: str | None = Field(default=None, max_length=50000)
 
 
 class ClearChatResponse(BaseModel):

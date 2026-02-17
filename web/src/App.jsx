@@ -1013,6 +1013,7 @@ function App() {
   const clearingChatRef = useRef(clearingChat);
   const sendingRef = useRef(sending);
   const speechAudioRef = useRef(null);
+  const speechObjectUrlRef = useRef('');
   const speechRequestIdRef = useRef(0);
   const contextSentValueRef = useRef(null);
   const contextEntriesRef = useRef(contextEntries);
@@ -1033,7 +1034,9 @@ function App() {
   }, []);
   const clearSpeechAudio = useCallback(() => {
     const activeAudio = speechAudioRef.current;
+    const activeObjectUrl = speechObjectUrlRef.current;
     speechAudioRef.current = null;
+    speechObjectUrlRef.current = '';
 
     if (activeAudio) {
       activeAudio.onplay = null;
@@ -1049,6 +1052,10 @@ function App() {
       activeAudio.pause();
       activeAudio.removeAttribute('src');
       activeAudio.load();
+    }
+
+    if (activeObjectUrl && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+      URL.revokeObjectURL(activeObjectUrl);
     }
   }, []);
 
@@ -2090,6 +2097,55 @@ function App() {
     return apiUrl(`/api/v1/decks/${deckId}/slides/${slideIndex}/transcript/speech/stream`);
   }
 
+  async function readResponseMessage(response, fallback) {
+    const statusSuffix = Number.isInteger(response.status) && response.status > 0 ? ` (${response.status})` : '';
+    const defaultMessage = `${fallback}${statusSuffix}`;
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+
+    if (contentType.includes('application/json')) {
+      const payload = await response.json().catch(() => null);
+      if (payload && typeof payload === 'object') {
+        return extractApiErrorMessage(payload, defaultMessage);
+      }
+    }
+
+    const responseText = await response.text().catch(() => '');
+    const normalized = String(responseText || '').replace(/\s+/g, ' ').trim();
+    if (normalized) {
+      return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
+    }
+
+    return defaultMessage;
+  }
+
+  async function fetchTranscriptSpeechBlobUrl(deckId, slideIndex) {
+    const response = await fetch(transcriptSpeechStreamUrl(deckId, slideIndex));
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+
+    if (!response.ok) {
+      throw new Error(await readResponseMessage(response, 'Failed to load narration audio'));
+    }
+
+    if (!contentType.startsWith('audio/')) {
+      throw new Error(
+        await readResponseMessage(
+          response,
+          `Narration response is not audio (received ${contentType || 'unknown content type'})`
+        )
+      );
+    }
+
+    const blob = await response.blob();
+    if (!blob.size) {
+      throw new Error('Narration response was empty.');
+    }
+    if (typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+      throw new Error('Audio playback is not supported in this browser.');
+    }
+
+    return URL.createObjectURL(blob);
+  }
+
   async function fetchSlides(deckId) {
     const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/slides`));
     if (!response.ok) {
@@ -2401,11 +2457,6 @@ function App() {
     speechRequestIdRef.current = requestId;
     clearSpeechAudio();
 
-    const audio = new Audio();
-    audio.preload = 'auto';
-    audio.src = transcriptSpeechStreamUrl(deck.deck_id, slideIndex);
-    speechAudioRef.current = audio;
-
     setError('');
     setActiveSpeechSlideIndex(slideIndex);
     setSpeechStatus('loading');
@@ -2413,79 +2464,92 @@ function App() {
     setSpeechDurationSeconds(0);
     setSpeechIsBuffering(true);
 
-    const syncProgress = () => {
-      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
-        return;
-      }
-      setSpeechCurrentTimeSeconds(audio.currentTime || 0);
-      const nextDuration = Number(audio.duration);
-      if (Number.isFinite(nextDuration) && nextDuration > 0) {
-        setSpeechDurationSeconds(nextDuration);
-      }
-    };
-
-    audio.onloadedmetadata = syncProgress;
-    audio.ondurationchange = syncProgress;
-    audio.ontimeupdate = syncProgress;
-
-    audio.onwaiting = () => {
-      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
-        return;
-      }
-      setSpeechIsBuffering(true);
-    };
-
-    audio.oncanplay = () => {
-      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
-        return;
-      }
-      setSpeechIsBuffering(false);
-    };
-
-    audio.oncanplaythrough = () => {
-      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
-        return;
-      }
-      setSpeechIsBuffering(false);
-    };
-
-    audio.onplay = () => {
-      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
-        return;
-      }
-      setSpeechStatus('playing');
-      setSpeechIsBuffering(false);
-    };
-
-    audio.onpause = () => {
-      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
-        return;
-      }
-      if (audio.ended) {
-        return;
-      }
-      setSpeechStatus('paused');
-      setSpeechIsBuffering(false);
-    };
-
-    audio.onended = () => {
-      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
-        return;
-      }
-      clearSpeechAudio();
-      resetSpeechPlaybackState();
-    };
-
-    audio.onerror = () => {
-      if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
-        return;
-      }
-      clearSpeechAudio();
-      resetSpeechPlaybackState();
-      setError('Speech playback failed.');
-    };
-
+    let blobUrl = '';
     try {
+      blobUrl = await fetchTranscriptSpeechBlobUrl(deck.deck_id, slideIndex);
+      if (speechRequestIdRef.current !== requestId) {
+        URL.revokeObjectURL(blobUrl);
+        return;
+      }
+
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audio.src = blobUrl;
+      speechAudioRef.current = audio;
+      speechObjectUrlRef.current = blobUrl;
+
+      const syncProgress = () => {
+        if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+          return;
+        }
+        setSpeechCurrentTimeSeconds(audio.currentTime || 0);
+        const nextDuration = Number(audio.duration);
+        if (Number.isFinite(nextDuration) && nextDuration > 0) {
+          setSpeechDurationSeconds(nextDuration);
+        }
+      };
+
+      audio.onloadedmetadata = syncProgress;
+      audio.ondurationchange = syncProgress;
+      audio.ontimeupdate = syncProgress;
+
+      audio.onwaiting = () => {
+        if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+          return;
+        }
+        setSpeechIsBuffering(true);
+      };
+
+      audio.oncanplay = () => {
+        if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+          return;
+        }
+        setSpeechIsBuffering(false);
+      };
+
+      audio.oncanplaythrough = () => {
+        if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+          return;
+        }
+        setSpeechIsBuffering(false);
+      };
+
+      audio.onplay = () => {
+        if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+          return;
+        }
+        setSpeechStatus('playing');
+        setSpeechIsBuffering(false);
+      };
+
+      audio.onpause = () => {
+        if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+          return;
+        }
+        if (audio.ended) {
+          return;
+        }
+        setSpeechStatus('paused');
+        setSpeechIsBuffering(false);
+      };
+
+      audio.onended = () => {
+        if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+          return;
+        }
+        clearSpeechAudio();
+        resetSpeechPlaybackState();
+      };
+
+      audio.onerror = () => {
+        if (speechRequestIdRef.current !== requestId || speechAudioRef.current !== audio) {
+          return;
+        }
+        clearSpeechAudio();
+        resetSpeechPlaybackState();
+        setError('Speech playback failed.');
+      };
+
       await audio.play();
     } catch (speechError) {
       if (speechRequestIdRef.current !== requestId) {

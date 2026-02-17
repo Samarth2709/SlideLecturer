@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { visit } from 'unist-util-visit';
@@ -914,7 +915,7 @@ function MessageBubble({
             rows={Math.min(14, Math.max(4, editDraft.split('\n').length + 1))}
           />
         ) : message.role === 'assistant' ? (
-          <ReactMarkdown remarkPlugins={[remarkCodeBlockDefault]} components={markdownComponents}>{normalizedAssistantMarkdown}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm, remarkCodeBlockDefault]} components={markdownComponents}>{normalizedAssistantMarkdown}</ReactMarkdown>
         ) : (
           <p>{message.content}</p>
         )}

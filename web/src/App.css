@@ -1361,6 +1361,30 @@ body.is-resizing-split * {
   padding: 0.14rem 0.36rem;
 }
 
+.message-content.assistant table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.6rem 0;
+  font-size: 0.9rem;
+}
+
+.message-content.assistant th,
+.message-content.assistant td {
+  border: 1px solid #3e4b5e;
+  padding: 0.4rem 0.7rem;
+  text-align: left;
+}
+
+.message-content.assistant th {
+  background: #202937;
+  color: #f1f5f9;
+  font-weight: 600;
+}
+
+.message-content.assistant tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.03);
+}
+
 .typing-indicator {
   margin: 0;
   color: var(--text-muted);

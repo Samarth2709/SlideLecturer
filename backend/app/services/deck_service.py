@@ -47,6 +47,7 @@ class DeckRecord:
     transcripts: list[str | None] = field(default_factory=list)
     transcript_slide_errors: list[str | None] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    content_hash: str = ""
     conversation_history: list[dict] = field(default_factory=list)
     is_first_message: bool = True
     _pdf_base64: str | None = None
@@ -67,6 +68,8 @@ class DeckService:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.transcript_cache_dir = self.storage_dir / "transcript_cache"
         self.transcript_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.conversations_dir = self.storage_dir / "conversations"
+        self.conversations_dir.mkdir(parents=True, exist_ok=True)
         self._decks: dict[str, DeckRecord] = {}
         self._lock = threading.RLock()
 
@@ -84,6 +87,8 @@ class DeckService:
             source_path = deck_dir / f"source{suffix}"
             with source_path.open("wb") as target:
                 shutil.copyfileobj(content_stream, target)
+
+            content_hash = self._compute_content_hash(source_path)
 
             if suffix == ".pdf":
                 pdf_path = deck_dir / "deck.pdf"
@@ -109,6 +114,7 @@ class DeckService:
                 slide_count=len(slide_text),
                 narrate_enabled=narrate_enabled,
                 slide_text=slide_text,
+                content_hash=content_hash,
                 transcript_cache_key=transcript_cache_key,
                 transcript_status="disabled" if not narrate_enabled else ("completed" if has_cached_transcripts else "queued"),
                 transcripts=cached_transcripts if cached_transcripts is not None else [None] * len(slide_text),
@@ -303,6 +309,57 @@ class DeckService:
         with deck.lock:
             deck.conversation_history.clear()
             deck.is_first_message = True
+            content_hash = deck.content_hash
+        if content_hash:
+            self.delete_conversation(content_hash)
+
+    def _compute_content_hash(self, file_path: Path) -> str:
+        return hashlib.sha256(file_path.read_bytes()).hexdigest()
+
+    def _conversation_path(self, content_hash: str) -> Path:
+        return self.conversations_dir / f"{content_hash}.json"
+
+    def load_conversation(self, content_hash: str) -> dict | None:
+        path = self._conversation_path(content_hash)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        if not isinstance(payload.get("branches_by_id"), dict):
+            return None
+        if not isinstance(payload.get("branch_order"), list):
+            return None
+
+        return payload
+
+    def save_conversation(self, content_hash: str, data: dict) -> None:
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        if "created_at" not in data:
+            data["created_at"] = data["updated_at"]
+
+        final_path = self._conversation_path(content_hash)
+        temp_path = final_path.with_name(f".{final_path.name}.{uuid4().hex}.tmp")
+        try:
+            temp_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            temp_path.replace(final_path)
+        except OSError:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+
+    def delete_conversation(self, content_hash: str) -> None:
+        path = self._conversation_path(content_hash)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def delete_deck(self, deck_id: str) -> None:
         with self._lock:

@@ -1009,11 +1009,13 @@ function App() {
   const queuedMessagesByBranchRef = useRef(queuedMessagesByBranch);
   const editingQueuedMessageIdRef = useRef(editingQueuedMessageId);
   const activeBranchIdRef = useRef(activeBranchId);
+  const branchOrderRef = useRef(branchOrder);
   const clearingChatRef = useRef(clearingChat);
   const sendingRef = useRef(sending);
   const speechAudioRef = useRef(null);
   const speechRequestIdRef = useRef(0);
   const contextSentValueRef = useRef(null);
+  const contextEntriesRef = useRef(contextEntries);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
   const messages = activeBranch?.messages || [WELCOME_MESSAGE];
@@ -1366,12 +1368,20 @@ function App() {
   }, [activeBranchId]);
 
   useEffect(() => {
+    branchOrderRef.current = branchOrder;
+  }, [branchOrder]);
+
+  useEffect(() => {
     clearingChatRef.current = clearingChat;
   }, [clearingChat]);
 
   useEffect(() => {
     sendingRef.current = sending;
   }, [sending]);
+
+  useEffect(() => {
+    contextEntriesRef.current = contextEntries;
+  }, [contextEntries]);
 
   const resetBranches = useCallback(() => {
     const resetBranchState = {
@@ -1399,6 +1409,95 @@ function App() {
     setIsBranchMapOpen(false);
     branchCounterRef.current = 1;
   }, []);
+
+  const restoreBranches = useCallback((conversationData) => {
+    const { branches_by_id, branch_order, active_branch_id, branch_counter } = conversationData;
+
+    const restoredBranches = {};
+    for (const [id, branch] of Object.entries(branches_by_id)) {
+      restoredBranches[id] = {
+        ...branch,
+        messages: [WELCOME_MESSAGE, ...branch.messages],
+      };
+    }
+
+    if (!restoredBranches[MAIN_BRANCH_ID]) {
+      restoredBranches[MAIN_BRANCH_ID] = {
+        id: MAIN_BRANCH_ID,
+        label: 'Branch 1',
+        parentBranchId: null,
+        parentMessageId: null,
+        messages: [WELCOME_MESSAGE],
+      };
+    }
+
+    branchesRef.current = restoredBranches;
+    setBranchesById(restoredBranches);
+
+    const restoredOrder =
+      branch_order && branch_order.length > 0 ? branch_order : [MAIN_BRANCH_ID];
+    branchOrderRef.current = restoredOrder;
+    setBranchOrder(restoredOrder);
+
+    const restoredActiveBranch =
+      active_branch_id && restoredBranches[active_branch_id]
+        ? active_branch_id
+        : MAIN_BRANCH_ID;
+    activeBranchIdRef.current = restoredActiveBranch;
+    setActiveBranchId(restoredActiveBranch);
+
+    const resetQueueState = {};
+    for (const branchId of restoredOrder) {
+      resetQueueState[branchId] = [];
+    }
+    queuedMessagesByBranchRef.current = resetQueueState;
+    setQueuedMessagesByBranch(resetQueueState);
+
+    editingQueuedMessageIdRef.current = null;
+    setEditingQueuedMessageId(null);
+    setQueueDraftSnapshot('');
+    setStreamingBranchId(null);
+    setIsBranchMapOpen(false);
+
+    branchCounterRef.current = typeof branch_counter === 'number' ? branch_counter : 1;
+  }, []);
+
+  async function saveConversationToBackend(deckId) {
+    if (!deckId) return;
+
+    const currentBranches = branchesRef.current;
+    const currentBranchOrder = branchOrderRef.current;
+    const currentActiveBranchId = activeBranchIdRef.current;
+
+    const sanitizedBranches = {};
+    for (const [id, branch] of Object.entries(currentBranches)) {
+      sanitizedBranches[id] = {
+        ...branch,
+        messages: branch.messages.filter((m) => m.id !== WELCOME_MESSAGE.id),
+      };
+    }
+
+    const hasUserMessages = Object.values(sanitizedBranches).some((branch) =>
+      branch.messages.some((m) => m.role === 'user')
+    );
+    if (!hasUserMessages) return;
+
+    try {
+      await fetch(apiUrl(`/api/v1/decks/${deckId}/conversation/save`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          branches_by_id: sanitizedBranches,
+          branch_order: currentBranchOrder,
+          active_branch_id: currentActiveBranchId,
+          branch_counter: branchCounterRef.current,
+          context_entries: contextEntriesRef.current,
+        }),
+      });
+    } catch (err) {
+      console.warn('Failed to save conversation', err);
+    }
+  }
 
   const resetTranscriptState = useCallback((totalSlides = 0) => {
     setTranscriptState(buildEmptyTranscriptState(totalSlides));
@@ -1573,6 +1672,8 @@ function App() {
       if (options.closeMap) {
         setIsBranchMapOpen(false);
       }
+
+      window.setTimeout(() => void saveConversationToBackend(deck?.deck_id), 50);
 
       return branchId;
     },
@@ -2086,10 +2187,18 @@ function App() {
       if (typeof payload?.narrate_enabled === 'boolean') {
         setNarrateEnabled(payload.narrate_enabled);
       }
-      resetBranches();
+      if (payload.conversation) {
+        restoreBranches(payload.conversation);
+        const restoredContext = Array.isArray(payload.conversation.context_entries)
+          ? payload.conversation.context_entries
+          : [];
+        setContextEntries(restoredContext);
+      } else {
+        resetBranches();
+        setContextEntries([]);
+      }
       resetTranscriptState(payload.slide_count || 0);
       setInputValue('');
-      setContextEntries([]);
       contextSentValueRef.current = null;
       await fetchSlides(payload.deck_id);
     } catch (uploadError) {
@@ -3028,6 +3137,8 @@ function App() {
       sendingRef.current = false;
       setSending(false);
       setStreamingBranchId(null);
+
+      void saveConversationToBackend(deck?.deck_id);
 
       const nextQueuedMessage = getNextQueuedMessageToSend(branchId);
       if (nextQueuedMessage?.content?.trim()) {

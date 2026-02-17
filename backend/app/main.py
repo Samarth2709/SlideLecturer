@@ -20,6 +20,8 @@ from .models import (
     DeckTranscriptsResponse,
     DeckUploadResponse,
     DeleteDeckResponse,
+    SaveConversationRequest,
+    SaveConversationResponse,
     SlideSummary,
 )
 from .services.ai_service import AIService
@@ -161,12 +163,16 @@ def upload_deck(
     if record.narrate_enabled:
         ai_service.start_transcript_generation(record.deck_id, target_words=175)
 
+    conversation = deck_service.load_conversation(record.content_hash)
+
     return DeckUploadResponse(
         deck_id=record.deck_id,
         filename=record.filename,
         slide_count=record.slide_count,
         created_at=record.created_at,
         narrate_enabled=record.narrate_enabled,
+        content_hash=record.content_hash,
+        conversation=conversation,
     )
 
 
@@ -429,6 +435,28 @@ def stream_slide_transcript_speech(deck_id: str, slide_index: int):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/api/v1/decks/{deck_id}/conversation/save", response_model=SaveConversationResponse)
+def save_conversation(deck_id: str, body: SaveConversationRequest) -> SaveConversationResponse:
+    try:
+        deck = deck_service.get_deck(deck_id)
+    except DeckNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Deck not found") from exc
+
+    conversation_data = {
+        "version": 1,
+        "content_hash": deck.content_hash,
+        "filename": deck.filename,
+        "slide_count": deck.slide_count,
+        "branches_by_id": body.branches_by_id,
+        "branch_order": body.branch_order,
+        "active_branch_id": body.active_branch_id,
+        "branch_counter": body.branch_counter,
+        "context_entries": body.context_entries,
+    }
+    deck_service.save_conversation(deck.content_hash, conversation_data)
+    return SaveConversationResponse(status="ok")
 
 
 @app.post("/api/v1/decks/{deck_id}/chat/clear", response_model=ClearChatResponse)

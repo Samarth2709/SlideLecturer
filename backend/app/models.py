@@ -14,6 +14,8 @@ class DeckUploadResponse(BaseModel):
     slide_count: int
     created_at: datetime
     narrate_enabled: bool
+    content_hash: str
+    conversation: dict | None = None
 
 
 class SlideSummary(BaseModel):
@@ -75,6 +77,18 @@ class ClearChatResponse(BaseModel):
 
 class DeleteDeckResponse(BaseModel):
     status: Literal["deleted"]
+
+
+class SaveConversationRequest(BaseModel):
+    branches_by_id: dict
+    branch_order: list[str]
+    active_branch_id: str
+    branch_counter: int
+    context_entries: list[str] = Field(default_factory=list)
+
+
+class SaveConversationResponse(BaseModel):
+    status: Literal["ok"]
 
 
 class ErrorResponse(BaseModel):

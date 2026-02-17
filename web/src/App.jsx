@@ -36,7 +36,13 @@ const DECK_PREFERENCES_STORAGE_PREFIX = 'slidelecturer.deckPreferences.v1';
 const SEARCH_SNIPPET_MAX_CHARS = 180;
 const MAX_CHAT_HISTORY_MESSAGES = 40;
 const MAX_CONTEXT_TOTAL_LENGTH = 50000;
-const CONTEXT_SEPARATOR = '\n\n---\n\n';
+const MAX_FILE_SIZE_BYTES = 500_000;
+const ALLOWED_FILE_EXTENSIONS = [
+  '.txt', '.md', '.csv', '.py', '.c', '.cpp', '.h', '.js', '.ts',
+  '.jsx', '.tsx', '.java', '.json', '.xml', '.html', '.css', '.scss',
+  '.yaml', '.yml', '.toml', '.ini', '.cfg', '.sh', '.bash', '.sql',
+  '.rb', '.go', '.rs', '.swift', '.kt', '.r', '.m', '.log',
+];
 
 const EMPTY_TRANSCRIPT_STATE = Object.freeze({
   status: 'queued',
@@ -742,6 +748,25 @@ function DeleteIcon({ className = 'icon' }) {
   );
 }
 
+function FileIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <polyline points="14 2 14 8 20 8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function TextIcon({ className = 'icon' }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+      <line x1="8" y1="13" x2="16" y2="13" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+      <line x1="8" y1="17" x2="12" y2="17" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function MessageBubble({
   message,
   isEditing,
@@ -969,6 +994,8 @@ function App() {
   const [streamingBranchId, setStreamingBranchId] = useState(null);
   const [clearingChat, setClearingChat] = useState(false);
   const [isBranchMapOpen, setIsBranchMapOpen] = useState(false);
+  const [expandedBranchIds, setExpandedBranchIds] = useState(new Set());
+  const [showAllTurns, setShowAllTurns] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState(null);
   const [messageDraft, setMessageDraft] = useState('');
   const [copiedMessageId, setCopiedMessageId] = useState(null);
@@ -991,9 +1018,13 @@ function App() {
   const [isResizingSplit, setIsResizingSplit] = useState(false);
   const [isDragActive, setIsDragActive] = useState(false);
   const [contextEntries, setContextEntries] = useState([]);
-  const [contextDraft, setContextDraft] = useState('');
-  const [editingContextIndex, setEditingContextIndex] = useState(null);
   const [isContextModalOpen, setIsContextModalOpen] = useState(false);
+  const [contextAddMode, setContextAddMode] = useState(null);
+  const [contextNameDraft, setContextNameDraft] = useState('');
+  const [contextContentDraft, setContextContentDraft] = useState('');
+  const [editingContextIndex, setEditingContextIndex] = useState(null);
+  const [expandedContextIndex, setExpandedContextIndex] = useState(null);
+  const [contextFileDragActive, setContextFileDragActive] = useState(false);
 
   const workspaceRef = useRef(null);
   const slideScrollRef = useRef(null);
@@ -1015,8 +1046,8 @@ function App() {
   const speechAudioRef = useRef(null);
   const speechObjectUrlRef = useRef('');
   const speechRequestIdRef = useRef(0);
-  const contextSentValueRef = useRef(null);
   const contextEntriesRef = useRef(contextEntries);
+  const contextFileInputRef = useRef(null);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
   const messages = activeBranch?.messages || [WELCOME_MESSAGE];
@@ -1080,27 +1111,6 @@ function App() {
       return `...${normalized.slice(-maxChars)}`;
     };
 
-    const findTurnForMessageId = (messageId) => {
-      if (!messageId) {
-        return null;
-      }
-
-      for (const branchId of branchOrder) {
-        const branch = branchesById[branchId];
-        if (!branch) {
-          continue;
-        }
-
-        const nonWelcomeMessages = nonWelcomeMessagesFor(branch);
-        const messageIndex = nonWelcomeMessages.findIndex((message) => message.id === messageId);
-        if (messageIndex !== -1) {
-          return Math.ceil((messageIndex + 1) / 2);
-        }
-      }
-
-      return null;
-    };
-
     const findUserMessageForAssistant = (messageId) => {
       if (!messageId) {
         return '';
@@ -1146,22 +1156,7 @@ function App() {
       return preview;
     };
 
-    const branchOrderIndex = new Map(branchOrder.map((branchId, index) => [branchId, index]));
-    const branchSummaries = new Map();
-    const branchesAtContext = new Map();
-    const contextIdOrder = [];
-    const seenContextIds = new Set();
-    const topContextIds = [];
-    const seenTopContexts = new Set();
-    const rootBranchIds = [];
-
-    const ensureContextOrder = (contextId) => {
-      if (!contextId || seenContextIds.has(contextId)) {
-        return;
-      }
-      seenContextIds.add(contextId);
-      contextIdOrder.push(contextId);
-    };
+    const branches = [];
 
     for (const branchId of branchOrder) {
       const branch = branchesById[branchId];
@@ -1178,183 +1173,67 @@ function App() {
         derivedFrom = `context "${getPromptPreview(branch.parentMessageId)}"`;
       }
 
-      branchSummaries.set(branchId, {
-        id: branch.id,
+      const contextNodes = assistantMessages.map((assistantMsg, index) => {
+        const contextPreview = getPromptPreview(assistantMsg.id);
+        const contextSummary = `Prompt: "${contextPreview}"`;
+
+        return {
+          key: `context:${branchId}:${assistantMsg.id}`,
+          contextId: assistantMsg.id,
+          title: `Turn ${index + 1}`,
+          summary: contextSummary,
+          tooltip: `${contextSummary} Click to branch from this context.`,
+          sourceBranchId: branchId,
+          sourceMessageId: assistantMsg.id,
+          canBranch: true,
+        };
+      });
+
+      branches.push({
+        id: branchId,
         label: branch.label,
         turnCount,
         messageCount: nonWelcomeMessages.length,
-        isActive: branch.id === activeBranchId,
+        isActive: branchId === activeBranchId,
         derivedFrom,
+        parentBranchId: branch.parentBranchId,
+        parentMessageId: branch.parentMessageId,
+        contextNodes,
       });
-
-      if (!assistantMessages.length) {
-        rootBranchIds.push(branchId);
-        continue;
-      }
-
-      const firstContextId = assistantMessages[0].id;
-      if (!seenTopContexts.has(firstContextId)) {
-        seenTopContexts.add(firstContextId);
-        topContextIds.push(firstContextId);
-      }
-
-      for (let index = 0; index < assistantMessages.length; index += 1) {
-        const contextId = assistantMessages[index].id;
-        const nextContextId = assistantMessages[index + 1]?.id || null;
-
-        ensureContextOrder(contextId);
-        if (nextContextId) {
-          ensureContextOrder(nextContextId);
-        }
-
-        if (!branchesAtContext.has(contextId)) {
-          branchesAtContext.set(contextId, []);
-        }
-
-        branchesAtContext.get(contextId).push({
-          branchId,
-          contextId,
-          nextContextId,
-        });
-      }
     }
 
-    const contextLabelById = new Map();
-    contextIdOrder.forEach((contextId, index) => {
-      contextLabelById.set(contextId, `Context Node ${index + 1}`);
-    });
-
-    const sortContextRefs = (refs) =>
-      [...refs].sort((firstRef, secondRef) => {
-        const firstIndex = branchOrderIndex.get(firstRef.branchId) ?? Number.MAX_SAFE_INTEGER;
-        const secondIndex = branchOrderIndex.get(secondRef.branchId) ?? Number.MAX_SAFE_INTEGER;
-        if (firstIndex !== secondIndex) {
-          return firstIndex - secondIndex;
-        }
-
-        return firstRef.branchId.localeCompare(secondRef.branchId);
-      });
-
-    const buildContextNode = (contextId, ancestry = new Set()) => {
-      if (!contextId) {
-        return null;
-      }
-
-      const ancestryKey = `context:${contextId}`;
-      if (ancestry.has(ancestryKey)) {
-        return null;
-      }
-
-      const nextAncestry = new Set(ancestry);
-      nextAncestry.add(ancestryKey);
-
-      const contextTurn = findTurnForMessageId(contextId);
-      const branchRefs = sortContextRefs(branchesAtContext.get(contextId) || []);
-      const preferredSourceRef =
-        branchRefs.find((reference) => reference.branchId === activeBranchId) || branchRefs[0] || null;
-      const sourceBranchId = preferredSourceRef?.branchId || null;
-      const branchNodes = branchRefs
-        .map((reference) => {
-          const summary = branchSummaries.get(reference.branchId);
-          if (!summary) {
-            return null;
+    // Compute deduplicated context nodes for "show all" mode.
+    // Child branches: show from fork point (parentMessageId) onward.
+    // Root branches: show from earliest child fork point onward.
+    for (const branch of branches) {
+      if (branch.parentMessageId) {
+        const forkIdx = branch.contextNodes.findIndex(
+          (cn) => cn.contextId === branch.parentMessageId
+        );
+        branch.dedupContextNodes = forkIdx >= 0
+          ? branch.contextNodes.slice(forkIdx)
+          : branch.contextNodes;
+      } else {
+        let earliestForkIdx = branch.contextNodes.length;
+        for (const other of branches) {
+          if (other.parentBranchId === branch.id && other.parentMessageId) {
+            const idx = branch.contextNodes.findIndex(
+              (cn) => cn.contextId === other.parentMessageId
+            );
+            if (idx >= 0 && idx < earliestForkIdx) {
+              earliestForkIdx = idx;
+            }
           }
-
-          const childContextNode = reference.nextContextId
-            ? buildContextNode(reference.nextContextId, nextAncestry)
-            : null;
-          const hasChildContext = Boolean(childContextNode);
-          const actionDescription = 'Click to switch to this branch.';
-
-          return {
-            key: `branch:${reference.branchId}:${reference.contextId}`,
-            branchId: summary.id,
-            label: summary.label,
-            turnCount: summary.turnCount,
-            messageCount: summary.messageCount,
-            isActive: summary.isActive,
-            hasChildContext,
-            kindLabel: 'Branch · click to switch',
-            tooltip: `${summary.label} derives from ${summary.derivedFrom}. ${actionDescription}`,
-            childContext: childContextNode,
-          };
-        })
-        .filter(Boolean);
-
-      const contextPreview = getPromptPreview(contextId);
-      const contextSummary = `Prompt: "${contextPreview}"`;
-      const contextAction = sourceBranchId
-        ? 'Click to branch from this context.'
-        : 'No branch action available for this context yet.';
-
-      return {
-        key: `context:${contextId}`,
-        contextId,
-        title: contextLabelById.get(contextId) || 'Context Node',
-        summary: contextSummary,
-        tooltip: `${contextSummary} ${contextAction}`,
-        sourceBranchId,
-        sourceMessageId: contextId,
-        canBranch: Boolean(sourceBranchId),
-        branches: branchNodes,
-      };
-    };
-
-    const rootContextNodes = topContextIds
-      .map((contextId) => buildContextNode(contextId))
-      .filter(Boolean);
-
-    if (rootContextNodes.length) {
-      return {
-        rootContexts: rootContextNodes,
-        hasNodes: true,
-      };
-    }
-
-    const rootBranches = rootBranchIds
-      .map((branchId) => {
-        const summary = branchSummaries.get(branchId);
-        if (!summary) {
-          return null;
         }
-
-        return {
-          key: `branch:${summary.id}:root`,
-          branchId: summary.id,
-          label: summary.label,
-          turnCount: summary.turnCount,
-          messageCount: summary.messageCount,
-          isActive: summary.isActive,
-          kindLabel: 'Branch · click to switch',
-          tooltip: `${summary.label} derives from ${summary.derivedFrom}. Click to switch to this branch.`,
-          hasChildContext: false,
-          childContext: null,
-        };
-      })
-      .filter(Boolean);
-
-    if (!rootBranches.length) {
-      return {
-        rootContexts: [],
-        hasNodes: false,
-      };
+        branch.dedupContextNodes = earliestForkIdx < branch.contextNodes.length
+          ? branch.contextNodes.slice(earliestForkIdx)
+          : branch.contextNodes;
+      }
     }
 
     return {
-      rootContexts: [
-        {
-          key: 'context:root',
-          contextId: 'root',
-          title: 'Context Node 1',
-          summary: 'Initial conversation context',
-          tooltip: 'Initial conversation context',
-          sourceBranchId: null,
-          sourceMessageId: null,
-          canBranch: false,
-          branches: rootBranches,
-        },
-      ],
-      hasNodes: true,
+      branches,
+      hasBranches: branches.length > 0,
     };
   }, [branchesById, branchOrder, activeBranchId]);
 
@@ -1414,6 +1293,8 @@ function App() {
     setQueueDraftSnapshot('');
     setStreamingBranchId(null);
     setIsBranchMapOpen(false);
+    setExpandedBranchIds(new Set());
+    setShowAllTurns(false);
     branchCounterRef.current = 1;
   }, []);
 
@@ -1465,6 +1346,8 @@ function App() {
     setQueueDraftSnapshot('');
     setStreamingBranchId(null);
     setIsBranchMapOpen(false);
+    setExpandedBranchIds(new Set());
+    setShowAllTurns(false);
 
     branchCounterRef.current = typeof branch_counter === 'number' ? branch_counter : 1;
   }, []);
@@ -1628,6 +1511,8 @@ function App() {
 
       if (options.closeMap) {
         setIsBranchMapOpen(false);
+        setExpandedBranchIds(new Set());
+        setShowAllTurns(false);
       }
     },
     [branchesById]
@@ -1678,6 +1563,8 @@ function App() {
 
       if (options.closeMap) {
         setIsBranchMapOpen(false);
+        setExpandedBranchIds(new Set());
+        setShowAllTurns(false);
       }
 
       window.setTimeout(() => void saveConversationToBackend(deck?.deck_id), 50);
@@ -1693,6 +1580,24 @@ function App() {
     },
     [activeBranchId, createBranchFromSource]
   );
+
+  const toggleBranchExpanded = useCallback((branchId) => {
+    setExpandedBranchIds((previous) => {
+      const next = new Set(previous);
+      if (next.has(branchId)) {
+        next.delete(branchId);
+      } else {
+        next.add(branchId);
+      }
+      return next;
+    });
+  }, []);
+
+  const closeBranchMap = useCallback(() => {
+    setIsBranchMapOpen(false);
+    setExpandedBranchIds(new Set());
+    setShowAllTurns(false);
+  }, []);
 
   const handleTreeNodeClick = useCallback(
     (node) => {
@@ -1851,7 +1756,7 @@ function App() {
     const handleEscape = (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        setIsBranchMapOpen(false);
+        closeBranchMap();
       }
     };
 
@@ -2245,9 +2150,24 @@ function App() {
       }
       if (payload.conversation) {
         restoreBranches(payload.conversation);
-        const restoredContext = Array.isArray(payload.conversation.context_entries)
+        const rawEntries = Array.isArray(payload.conversation.context_entries)
           ? payload.conversation.context_entries
           : [];
+        const restoredContext = rawEntries
+          .map((e, i) => {
+            if (typeof e === 'string') {
+              return { name: `Entry ${i + 1}`, content: e, type: 'text' };
+            }
+            if (e && typeof e === 'object' && e.content) {
+              return {
+                name: String(e.name || `Entry ${i + 1}`),
+                content: String(e.content),
+                type: e.type === 'file' ? 'file' : 'text',
+              };
+            }
+            return null;
+          })
+          .filter(Boolean);
         setContextEntries(restoredContext);
       } else {
         resetBranches();
@@ -2255,7 +2175,6 @@ function App() {
       }
       resetTranscriptState(payload.slide_count || 0);
       setInputValue('');
-      contextSentValueRef.current = null;
       await fetchSlides(payload.deck_id);
     } catch (uploadError) {
       setError(normalizeError(uploadError, 'Failed to upload deck'));
@@ -2949,7 +2868,6 @@ function App() {
       setEditingMessageId(null);
       setMessageDraft('');
       setCopiedMessageId(null);
-      contextSentValueRef.current = null;
     } catch (clearError) {
       setError(normalizeError(clearError, 'Failed to clear chat'));
     } finally {
@@ -2959,53 +2877,113 @@ function App() {
   }
 
   function openContextModal() {
-    setContextDraft('');
-    setEditingContextIndex(null);
+    resetContextForm();
     setIsContextModalOpen(true);
   }
 
   function closeContextModal() {
     setIsContextModalOpen(false);
+    resetContextForm();
+  }
+
+  function resetContextForm() {
+    setContextAddMode(null);
+    setContextNameDraft('');
+    setContextContentDraft('');
     setEditingContextIndex(null);
-    setContextDraft('');
   }
 
-  function getJoinedContextLength(entries) {
-    if (!entries.length) return 0;
-    return entries.join(CONTEXT_SEPARATOR).length;
+  function getTotalContentLength(entries) {
+    return entries.reduce((sum, entry) => sum + (entry.content || '').length, 0);
   }
 
-  function addContextEntry() {
-    const trimmed = contextDraft.trim();
-    if (!trimmed) return;
+  function saveContextEntry() {
+    const name = contextNameDraft.trim();
+    const content = contextContentDraft.trim();
+    if (!name || !content) return;
+    const existingType = editingContextIndex !== null ? contextEntries[editingContextIndex]?.type : null;
+    const entry = { name, content, type: existingType || 'text' };
     const prospective = editingContextIndex !== null
-      ? contextEntries.map((entry, i) => (i === editingContextIndex ? trimmed : entry))
-      : [...contextEntries, trimmed];
-    if (getJoinedContextLength(prospective) > MAX_CONTEXT_TOTAL_LENGTH) {
+      ? contextEntries.map((e, i) => (i === editingContextIndex ? entry : e))
+      : [...contextEntries, entry];
+    if (getTotalContentLength(prospective) > MAX_CONTEXT_TOTAL_LENGTH) {
       return;
     }
     setContextEntries(prospective);
-    if (editingContextIndex !== null) {
-      setEditingContextIndex(null);
+    resetContextForm();
+  }
+
+  function addContextFile(file) {
+    if (!file) return;
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      setError(`File too large (${(file.size / 1024).toFixed(0)} KB). Max is ${MAX_FILE_SIZE_BYTES / 1000} KB.`);
+      return;
     }
-    setContextDraft('');
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const content = e.target.result;
+      const entry = { name: file.name, content, type: 'file' };
+      setContextEntries((prev) => {
+        const prospective = [...prev, entry];
+        if (getTotalContentLength(prospective) > MAX_CONTEXT_TOTAL_LENGTH) {
+          setError('File content exceeds the total content size limit.');
+          return prev;
+        }
+        return prospective;
+      });
+    };
+    reader.readAsText(file);
+  }
+
+  function handleContextFileInput(event) {
+    const file = event.target.files?.[0];
+    if (file) addContextFile(file);
+    event.target.value = '';
+  }
+
+  function handleContextFileDrop(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextFileDragActive(false);
+    const file = event.dataTransfer?.files?.[0];
+    if (file) addContextFile(file);
+  }
+
+  function handleContextFileDragOver(event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function handleContextFileDragEnter(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextFileDragActive(true);
+  }
+
+  function handleContextFileDragLeave(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextFileDragActive(false);
   }
 
   function startEditingContextEntry(index) {
+    const entry = contextEntries[index];
+    if (!entry) return;
     setEditingContextIndex(index);
-    setContextDraft(contextEntries[index]);
-  }
-
-  function cancelEditingContextEntry() {
-    setEditingContextIndex(null);
-    setContextDraft('');
+    setContextAddMode('text');
+    setContextNameDraft(entry.name);
+    setContextContentDraft(entry.content);
   }
 
   function deleteContextEntry(index) {
     setContextEntries((prev) => prev.filter((_, i) => i !== index));
+    if (expandedContextIndex === index) {
+      setExpandedContextIndex(null);
+    } else if (expandedContextIndex !== null && expandedContextIndex > index) {
+      setExpandedContextIndex((prev) => prev - 1);
+    }
     if (editingContextIndex === index) {
-      setEditingContextIndex(null);
-      setContextDraft('');
+      resetContextForm();
     } else if (editingContextIndex !== null && editingContextIndex > index) {
       setEditingContextIndex((prev) => prev - 1);
     }
@@ -3013,8 +2991,12 @@ function App() {
 
   function deleteAllContextEntries() {
     setContextEntries([]);
-    setEditingContextIndex(null);
-    setContextDraft('');
+    setExpandedContextIndex(null);
+    resetContextForm();
+  }
+
+  function toggleExpandContextEntry(index) {
+    setExpandedContextIndex((prev) => (prev === index ? null : index));
   }
 
   function startEditingMessage(messageId) {
@@ -3144,11 +3126,11 @@ function App() {
           history: branchHistory,
           current_slide_index: normalizedRequestContext.currentSlideIndex,
           focused_slide_index: normalizedRequestContext.focusedSlideIndex,
-          additional_context: (() => {
-            if (!contextSnapshot.length) return null;
-            const joined = contextSnapshot.join(CONTEXT_SEPARATOR);
-            return joined !== contextSentValueRef.current ? joined : null;
-          })(),
+          additional_content: contextSnapshot.map((entry) => ({
+            name: entry.name,
+            content: entry.content,
+            type: entry.type,
+          })),
         }),
       });
 
@@ -3181,12 +3163,6 @@ function App() {
         }
       });
 
-      if (contextSnapshot.length) {
-        const joined = contextSnapshot.join(CONTEXT_SEPARATOR);
-        if (joined !== contextSentValueRef.current) {
-          contextSentValueRef.current = joined;
-        }
-      }
     } catch (streamError) {
       const message = normalizeError(streamError, 'Failed to stream AI response');
       updateBranchMessages(branchId, (previous) =>
@@ -3463,69 +3439,95 @@ function App() {
     }
   }
 
-  function renderBranchNodes(nodes, depth = 0) {
-    if (!nodes.length) {
+  function renderFlatBranchList(branches) {
+    if (!branches.length) {
       return null;
     }
 
     return (
-      <ul className={`branch-tree-level ${depth === 0 ? 'root' : 'nested'}`} role={depth === 0 ? 'list' : undefined}>
-        {nodes.map((node) => (
-          <li key={node.key} className="branch-tree-item">
-            <button
-              type="button"
-              className={`branch-node ${node.isActive ? 'active' : ''}`}
-              onClick={() => handleTreeNodeClick(node)}
-              title={node.tooltip}
-            >
-              <div className="branch-node-head">
-                <span className="branch-node-title">{node.label}</span>
-                <span className="branch-node-meta">
-                  {node.turnCount} turns · {node.messageCount} messages
-                </span>
-              </div>
-              <p className="branch-node-kind">
-                {node.kindLabel}
-              </p>
-              <span className="branch-node-tooltip" role="tooltip">
-                {node.tooltip}
-              </span>
-            </button>
-            {node.childContext ? renderContextNodes([node.childContext], depth + 1) : null}
-          </li>
-        ))}
-      </ul>
-    );
-  }
+      <ul className="branch-flat-list" role="list">
+        {branches.map((branch) => {
+          const isExpanded = showAllTurns || expandedBranchIds.has(branch.id);
+          const visibleNodes = showAllTurns
+            ? branch.dedupContextNodes
+            : branch.contextNodes;
+          const hasContextNodes = branch.contextNodes.length > 0;
+          const hasVisibleNodes = visibleNodes.length > 0;
 
-  function renderContextNodes(nodes, depth = 0) {
-    if (!nodes.length) {
-      return null;
-    }
+          return (
+            <li key={branch.id} className="branch-flat-item">
+              <div className={`branch-flat-card ${branch.isActive ? 'active' : ''}`}>
+                <button
+                  type="button"
+                  className="branch-flat-main"
+                  onClick={() => handleTreeNodeClick({ branchId: branch.id })}
+                  title={`${branch.label} derives from ${branch.derivedFrom}. Click to switch.`}
+                >
+                  <div className="branch-flat-head">
+                    <span className="branch-flat-title">
+                      {branch.label}
+                      {branch.isActive ? (
+                        <span className="branch-flat-active-badge">Active</span>
+                      ) : null}
+                    </span>
+                    <span className="branch-flat-meta">
+                      {branch.turnCount} turns &middot; {branch.messageCount} msgs
+                    </span>
+                  </div>
+                  <p className="branch-flat-derived">
+                    Derived from {branch.derivedFrom}
+                  </p>
+                </button>
 
-    return (
-      <ul className={`branch-tree-level ${depth === 0 ? 'root' : 'nested'}`} role={depth === 0 ? 'list' : undefined}>
-        {nodes.map((node) => (
-          <li key={node.key} className="branch-tree-item">
-            {node.canBranch && !sending && !clearingChat ? (
-              <button
-                type="button"
-                className="branch-context-node interactive"
-                title={node.tooltip}
-                onClick={() => handleContextNodeClick(node)}
-              >
-                <p className="branch-context-title">{node.title}</p>
-                <p className="branch-context-meta">{node.summary}</p>
-              </button>
-            ) : (
-              <div className="branch-context-node" title={node.tooltip}>
-                <p className="branch-context-title">{node.title}</p>
-                <p className="branch-context-meta">{node.summary}</p>
+                {hasContextNodes && !showAllTurns ? (
+                  <button
+                    type="button"
+                    className="branch-flat-expand"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleBranchExpanded(branch.id);
+                    }}
+                    aria-expanded={isExpanded}
+                    aria-label={isExpanded ? 'Hide context nodes' : 'Show context nodes'}
+                  >
+                    {isExpanded
+                      ? `Hide turns (${branch.contextNodes.length})`
+                      : `Show turns (${branch.contextNodes.length})`}
+                  </button>
+                ) : null}
               </div>
-            )}
-            {renderBranchNodes(node.branches, depth + 1)}
-          </li>
-        ))}
+
+              {isExpanded && hasVisibleNodes ? (
+                <ul className="branch-context-list" role="list">
+                  {visibleNodes.map((ctxNode) => {
+                    const canInteract = ctxNode.canBranch && !sending && !clearingChat;
+
+                    return (
+                      <li key={ctxNode.key} className="branch-context-list-item">
+                        {canInteract ? (
+                          <button
+                            type="button"
+                            className="branch-context-node interactive"
+                            title={ctxNode.tooltip}
+                            onClick={() => handleContextNodeClick(ctxNode)}
+                          >
+                            <p className="branch-context-title">{ctxNode.title}</p>
+                            <p className="branch-context-meta">{ctxNode.summary}</p>
+                          </button>
+                        ) : (
+                          <div className="branch-context-node" title={ctxNode.tooltip}>
+                            <p className="branch-context-title">{ctxNode.title}</p>
+                            <p className="branch-context-meta">{ctxNode.summary}</p>
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : null}
+            </li>
+          );
+        })}
       </ul>
     );
   }
@@ -3952,7 +3954,7 @@ function App() {
                 type="button"
                 className="ghost-btn icon-btn"
                 onClick={() => setIsBranchMapOpen(true)}
-                disabled={!branchTree.hasNodes}
+                disabled={!branchTree.hasBranches}
                 aria-label="View conversation branches"
                 title="View branches"
               >
@@ -4110,7 +4112,7 @@ function App() {
         <div
           className="branch-map-backdrop"
           role="presentation"
-          onClick={() => setIsBranchMapOpen(false)}
+          onClick={closeBranchMap}
         >
           <section
             className="branch-map-modal"
@@ -4122,21 +4124,32 @@ function App() {
             <header className="branch-map-header">
               <div>
                 <h3>Conversation Branches</h3>
-                <p>Click a branch to switch. Click a context node to create a new branch from that context.</p>
+                <p>Click a branch to switch. Expand turns to create a new branch from any context.</p>
               </div>
-              <button
-                type="button"
-                className="ghost-btn"
-                onClick={() => setIsBranchMapOpen(false)}
-              >
-                Close
-              </button>
+              <div className="branch-map-header-actions">
+                {branchTree.branches.length > 1 ? (
+                  <button
+                    type="button"
+                    className={`ghost-btn branch-show-all-btn ${showAllTurns ? 'active' : ''}`}
+                    onClick={() => setShowAllTurns((prev) => !prev)}
+                  >
+                    {showAllTurns ? 'Collapse all' : 'Show all turns'}
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  onClick={closeBranchMap}
+                >
+                  Close
+                </button>
+              </div>
             </header>
 
             <div className="branch-map-tree">
-              {branchTree.rootContexts.length ? (
+              {branchTree.hasBranches ? (
                 <div className="branch-tree-shell">
-                  {renderContextNodes(branchTree.rootContexts)}
+                  {renderFlatBranchList(branchTree.branches)}
                 </div>
               ) : (
                 <p className="branch-tree-empty">No branches yet.</p>
@@ -4156,13 +4169,13 @@ function App() {
             className="context-modal"
             role="dialog"
             aria-modal="true"
-            aria-label="Additional context"
+            aria-label="Additional content"
             onClick={(event) => event.stopPropagation()}
           >
             <header className="context-modal-header">
               <div>
-                <h3>Additional Context</h3>
-                <p>{contextEntries.length ? `${contextEntries.length} entr${contextEntries.length === 1 ? 'y' : 'ies'}` : 'No entries yet'}</p>
+                <h3>Additional Content</h3>
+                <p>{contextEntries.length ? `${contextEntries.length} item${contextEntries.length === 1 ? '' : 's'}` : 'No items yet'}</p>
               </div>
               <div className="context-modal-header-actions">
                 {contextEntries.length > 0 ? (
@@ -4188,90 +4201,109 @@ function App() {
               {contextEntries.length > 0 ? (
                 <ul className="context-entry-list">
                   {contextEntries.map((entry, index) => (
-                    <li key={index} className="context-entry-item">
-                      <div className="context-entry-text">{entry}</div>
-                      <div className="context-entry-actions">
-                        <button
-                          type="button"
-                          className="message-action-btn"
-                          onClick={() => startEditingContextEntry(index)}
-                          title="Edit"
-                        >
-                          <EditIcon />
-                        </button>
-                        <button
-                          type="button"
-                          className="message-action-btn"
-                          onClick={() => deleteContextEntry(index)}
-                          title="Delete"
-                        >
-                          <DeleteIcon />
-                        </button>
+                    <li key={index} className={`context-entry-item${expandedContextIndex === index ? ' expanded' : ''}`}>
+                      <div
+                        className="context-entry-header"
+                        onClick={() => toggleExpandContextEntry(index)}
+                        role="button"
+                        tabIndex={0}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') toggleExpandContextEntry(index); }}
+                      >
+                        <span className="context-entry-type-badge" title={entry.type === 'file' ? 'File' : 'Text'}>
+                          {entry.type === 'file' ? <FileIcon /> : <TextIcon />}
+                        </span>
+                        <span className="context-entry-name">{entry.name}</span>
+                        <div className="context-entry-actions">
+                          <button
+                            type="button"
+                            className="message-action-btn"
+                            onClick={(e) => { e.stopPropagation(); startEditingContextEntry(index); }}
+                            title="Edit"
+                          >
+                            <EditIcon />
+                          </button>
+                          <button
+                            type="button"
+                            className="message-action-btn"
+                            onClick={(e) => { e.stopPropagation(); deleteContextEntry(index); }}
+                            title="Delete"
+                          >
+                            <DeleteIcon />
+                          </button>
+                        </div>
                       </div>
+                      {expandedContextIndex === index ? (
+                        <div className="context-entry-content-preview">
+                          <pre>{entry.content}</pre>
+                        </div>
+                      ) : null}
                     </li>
                   ))}
                 </ul>
               ) : null}
 
-              <div className="context-entry-form">
-                {(() => {
-                  const trimmed = contextDraft.trim();
-                  const prospective = !trimmed ? contextEntries
-                    : editingContextIndex !== null
-                      ? contextEntries.map((e, i) => (i === editingContextIndex ? trimmed : e))
-                      : [...contextEntries, trimmed];
-                  const totalLength = getJoinedContextLength(prospective);
-                  const overLimit = trimmed && totalLength > MAX_CONTEXT_TOTAL_LENGTH;
-                  const currentLength = getJoinedContextLength(contextEntries);
-                  return (
-                    <>
-                      <textarea
-                        className="context-modal-textarea"
-                        value={contextDraft}
-                        onChange={(event) => setContextDraft(event.target.value)}
-                        placeholder="Enter additional context (e.g., course notes, syllabus details, key topics to focus on...)"
-                        rows={4}
-                        autoFocus
-                      />
-                      <div className="context-entry-form-actions">
-                        {currentLength > 0 ? (
-                          <span className={`context-char-count${overLimit ? ' over-limit' : ''}`}>
-                            {currentLength.toLocaleString()} / {MAX_CONTEXT_TOTAL_LENGTH.toLocaleString()}
-                          </span>
-                        ) : null}
-                        {editingContextIndex !== null ? (
-                          <>
-                            <button
-                              type="button"
-                              className="ghost-btn"
-                              onClick={cancelEditingContextEntry}
-                            >
-                              Cancel
-                            </button>
-                            <button
-                              type="button"
-                              className="ghost-btn primary-btn"
-                              onClick={addContextEntry}
-                              disabled={!trimmed || overLimit}
-                            >
-                              Save
-                            </button>
-                          </>
-                        ) : (
-                          <button
-                            type="button"
-                            className="ghost-btn primary-btn"
-                            onClick={addContextEntry}
-                            disabled={!trimmed || overLimit}
-                          >
-                            Add
-                          </button>
-                        )}
-                      </div>
-                    </>
-                  );
-                })()}
-              </div>
+              {contextAddMode === 'text' ? (
+                <div className="context-entry-form">
+                  <input
+                    type="text"
+                    className="context-name-input"
+                    placeholder="Name"
+                    value={contextNameDraft}
+                    onChange={(e) => setContextNameDraft(e.target.value)}
+                    autoFocus
+                  />
+                  <textarea
+                    className="context-modal-textarea"
+                    value={contextContentDraft}
+                    onChange={(e) => setContextContentDraft(e.target.value)}
+                    placeholder="Enter content (e.g., course notes, code, key topics...)"
+                    rows={6}
+                  />
+                  <div className="context-entry-form-actions">
+                    <span className="context-char-count">
+                      {getTotalContentLength(contextEntries).toLocaleString()} / {MAX_CONTEXT_TOTAL_LENGTH.toLocaleString()}
+                    </span>
+                    <button type="button" className="ghost-btn" onClick={resetContextForm}>
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost-btn primary-btn"
+                      onClick={saveContextEntry}
+                      disabled={!contextNameDraft.trim() || !contextContentDraft.trim()}
+                    >
+                      {editingContextIndex !== null ? 'Save' : 'Add'}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="context-add-buttons">
+                  <button type="button" className="ghost-btn" onClick={() => setContextAddMode('text')}>
+                    + Add Text
+                  </button>
+                  <div
+                    className={`context-file-dropzone${contextFileDragActive ? ' drag-active' : ''}`}
+                    onClick={() => contextFileInputRef.current?.click()}
+                    onDrop={handleContextFileDrop}
+                    onDragOver={handleContextFileDragOver}
+                    onDragEnter={handleContextFileDragEnter}
+                    onDragLeave={handleContextFileDragLeave}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') contextFileInputRef.current?.click(); }}
+                  >
+                    <FileIcon />
+                    <span>Drop file here or click to browse</span>
+                    <input
+                      ref={contextFileInputRef}
+                      type="file"
+                      accept={ALLOWED_FILE_EXTENSIONS.join(',')}
+                      onChange={handleContextFileInput}
+                      style={{ display: 'none' }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           </section>
         </div>

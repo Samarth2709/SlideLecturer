@@ -63,12 +63,18 @@ class ChatHistoryTurn(BaseModel):
     content: str = Field(min_length=1, max_length=50000)
 
 
+class ContentEntry(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    content: str = Field(min_length=1, max_length=50000)
+    type: Literal["text", "file"] = "text"
+
+
 class ChatStreamRequest(BaseModel):
     question: str = Field(min_length=1, max_length=6000)
     history: list[ChatHistoryTurn] = Field(default_factory=list, max_length=40)
     current_slide_index: int | None = Field(default=None, ge=0)
     focused_slide_index: int | None = Field(default=None, ge=0)
-    additional_context: str | None = Field(default=None, max_length=50000)
+    additional_content: list[ContentEntry] = Field(default_factory=list, max_length=20)
 
 
 class ClearChatResponse(BaseModel):
@@ -84,7 +90,7 @@ class SaveConversationRequest(BaseModel):
     branch_order: list[str]
     active_branch_id: str
     branch_counter: int
-    context_entries: list[str] = Field(default_factory=list)
+    context_entries: list[dict] = Field(default_factory=list)
 
 
 class SaveConversationResponse(BaseModel):

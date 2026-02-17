@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import json
+import re
 import threading
 from datetime import datetime, timezone
-from typing import Generator
+from typing import Any, Generator
 
-from anthropic import Anthropic
+from anthropic import Anthropic, NOT_GIVEN
 
 from ..config import settings
 from ..prompts import (
@@ -17,7 +19,11 @@ from ..prompts import (
     build_transcript_prompt,
     build_user_prompt,
 )
+from .content_tools import ALL_TOOLS, ContentToolResolver
 from .deck_service import DeckNotFoundError, DeckRecord, DeckService
+
+_MAX_TOOL_ROUNDS = 5
+_TOOL_INDICATOR_RE = re.compile(r"\n*> \*(?:Listing additional content|Reading \"[^\"]*\"|Using [^*]*)\.{3}\*\n*")
 
 
 class AIService:
@@ -57,7 +63,7 @@ class AIService:
         question: str,
         focused_slide_index: int | None,
         history: list[dict[str, str]] | None = None,
-        additional_context: str | None = None,
+        additional_content: list[dict[str, Any]] | None = None,
     ) -> Generator[str, None, None]:
         if not self.is_available:
             yield "[Error: AI service not available. Set ANTHROPIC_API_KEY.]"
@@ -71,11 +77,15 @@ class AIService:
             return
 
         if history is not None:
-            normalized_history = [
-                {"role": entry["role"], "content": entry["content"]}
-                for entry in history[-20:]
-                if entry.get("role") in {"user", "assistant"} and entry.get("content")
-            ]
+            normalized_history = []
+            for entry in history[-20:]:
+                if entry.get("role") not in {"user", "assistant"} or not entry.get("content"):
+                    continue
+                content = entry["content"]
+                if entry["role"] == "assistant":
+                    content = _TOOL_INDICATOR_RE.sub("\n\n", content).strip()
+                if content:
+                    normalized_history.append({"role": entry["role"], "content": content})
         else:
             with deck.lock:
                 normalized_history = list(deck.conversation_history[-20:])
@@ -95,10 +105,11 @@ class AIService:
             if is_first_message:
                 user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
 
-        if additional_context:
-            user_content.append(self._build_text_block(
-                f"The student has provided the following additional context about these slides:\n\n{additional_context}"
-            ))
+        resolver = ContentToolResolver(additional_content or [])
+        tools = ALL_TOOLS if resolver.has_content() else None
+
+        if resolver.has_content():
+            user_content.append(self._build_text_block(resolver.content_names_summary()))
 
         prompt_text = build_user_prompt(question)
         if focused_slide_index is not None:
@@ -122,16 +133,87 @@ class AIService:
         )
 
         full_response = ""
+        clean_response = ""
         try:
-            with self.client.messages.stream(
-                model=settings.model_name,
-                max_tokens=2048,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-            ) as stream:
-                for text in stream.text_stream:
-                    full_response += text
-                    yield text
+            for round_num in range(_MAX_TOOL_ROUNDS + 1):
+                tool_use_blocks: list[dict] = []
+
+                with self.client.messages.stream(
+                    model=settings.model_name,
+                    max_tokens=2048,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                    tools=tools if tools else NOT_GIVEN,
+                ) as stream:
+                    current_block_type: str | None = None
+                    current_tool_use: dict | None = None
+
+                    for event in stream:
+                        if event.type == "content_block_start":
+                            block = event.content_block
+                            if block.type == "text":
+                                current_block_type = "text"
+                            elif block.type == "tool_use":
+                                current_block_type = "tool_use"
+                                current_tool_use = {
+                                    "id": block.id,
+                                    "name": block.name,
+                                    "input_json": "",
+                                }
+
+                        elif event.type == "content_block_delta":
+                            if current_block_type == "text" and hasattr(event.delta, "text"):
+                                full_response += event.delta.text
+                                clean_response += event.delta.text
+                                yield event.delta.text
+                            elif current_block_type == "tool_use" and hasattr(event.delta, "partial_json"):
+                                current_tool_use["input_json"] += event.delta.partial_json
+
+                        elif event.type == "content_block_stop":
+                            if current_block_type == "tool_use" and current_tool_use:
+                                tool_use_blocks.append(current_tool_use)
+                            current_block_type = None
+                            current_tool_use = None
+
+                    final_message = stream.get_final_message()
+
+                # If model did not request tool use, we are done.
+                if not tool_use_blocks or final_message.stop_reason != "tool_use":
+                    break
+
+                # Build the assistant message content from the final message.
+                assistant_content: list[dict] = []
+                for block in final_message.content:
+                    if block.type == "text":
+                        assistant_content.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        })
+                messages.append({"role": "assistant", "content": assistant_content})
+
+                # Execute each tool and build the tool results message.
+                tool_results: list[dict] = []
+                for tool_block in tool_use_blocks:
+                    try:
+                        input_data = json.loads(tool_block["input_json"]) if tool_block["input_json"] else {}
+                    except json.JSONDecodeError:
+                        input_data = {}
+                    label = self._tool_call_label(tool_block["name"], input_data)
+                    indicator = f"\n\n> *{label}*\n\n"
+                    full_response += indicator
+                    yield indicator
+                    result = resolver.execute(tool_block["name"], input_data)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_block["id"],
+                        "content": result,
+                    })
+                messages.append({"role": "user", "content": tool_results})
+
         except Exception as exc:  # noqa: BLE001
             self._log_provider_error(deck.deck_id, str(exc))
             yield f"[Error: {exc}]"
@@ -142,7 +224,7 @@ class AIService:
         if history is None:
             with deck.lock:
                 deck.conversation_history.append({"role": "user", "content": prompt_text})
-                deck.conversation_history.append({"role": "assistant", "content": full_response})
+                deck.conversation_history.append({"role": "assistant", "content": clean_response})
                 deck.is_first_message = False
 
     def _generate_transcripts_worker(self, deck_id: str, target_words: int) -> None:
@@ -259,6 +341,15 @@ class AIService:
         if not normalized_transcript:
             raise RuntimeError("Model returned an empty transcript.")
         return normalized_transcript
+
+    @staticmethod
+    def _tool_call_label(tool_name: str, tool_input: dict[str, Any]) -> str:
+        if tool_name == "list_additional_content":
+            return "Listing additional content..."
+        if tool_name == "get_additional_content":
+            name = tool_input.get("name", "")
+            return f"Reading \"{name}\"..." if name else "Reading additional content..."
+        return f"Using {tool_name}..."
 
     @staticmethod
     def _extract_response_text(response) -> str:

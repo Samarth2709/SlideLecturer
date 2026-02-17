@@ -17,7 +17,6 @@ from ..prompts import (
     TRANSCRIPT_SYSTEM_PROMPT,
     build_focus_prompt,
     build_transcript_prompt,
-    build_user_prompt,
 )
 from .content_tools import ALL_TOOLS, ContentToolResolver
 from .deck_service import DeckNotFoundError, DeckRecord, DeckService
@@ -111,7 +110,7 @@ class AIService:
         if resolver.has_content():
             user_content.append(self._build_text_block(resolver.content_names_summary()))
 
-        prompt_text = build_user_prompt(question)
+        prompt_text = question
         if focused_slide_index is not None:
             slide_number = focused_slide_index + 1
             focus_png = self.deck_service.render_slide_png(deck.deck_id, focused_slide_index, scale=2.0)

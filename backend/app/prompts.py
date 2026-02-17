@@ -14,15 +14,10 @@ def _load_prompt(filename: str) -> str:
 
 
 SYSTEM_PROMPT = _load_prompt("system_prompt.md")
-USER_PROMPT_TEMPLATE = _load_prompt("user_prompt.md")
 FOCUS_PROMPT_TEMPLATE = _load_prompt("focus_prompt.md")
 TRANSCRIPT_PROMPT_TEMPLATE = _load_prompt("transcript_prompt.md")
 TRANSCRIPT_SYSTEM_PROMPT = _load_prompt("transcript_system_prompt.md")
 
-
-
-def build_user_prompt(question: str) -> str:
-    return USER_PROMPT_TEMPLATE.format(question=question)
 
 
 

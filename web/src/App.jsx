@@ -1010,7 +1010,7 @@ function App() {
   const [speechCurrentTimeSeconds, setSpeechCurrentTimeSeconds] = useState(0);
   const [speechDurationSeconds, setSpeechDurationSeconds] = useState(0);
   const [speechIsBuffering, setSpeechIsBuffering] = useState(false);
-  const [narrateEnabled, setNarrateEnabled] = useState(true);
+  const [narrateEnabled, setNarrateEnabled] = useState(false);
   const [bookmarkedSlideIndices, setBookmarkedSlideIndices] = useState([]);
   const [showBookmarkedOnly, setShowBookmarkedOnly] = useState(false);
   const [slideSearchQuery, setSlideSearchQuery] = useState('');

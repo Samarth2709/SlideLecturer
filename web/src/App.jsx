@@ -3265,6 +3265,25 @@ function App() {
     await submitComposerMessage();
   }
 
+  async function sendNextChunk() {
+    if (!deck?.deck_id || clearingChatRef.current) {
+      return;
+    }
+    const question = 'Next chunk';
+    if (sendingRef.current) {
+      enqueueMessageForBranch(activeBranchId, question, {
+        currentSlideIndex,
+        focusedSlideIndex,
+      });
+      return;
+    }
+    await streamMessageToBranch({
+      branchId: activeBranchId,
+      question,
+      queuedMessageId: null,
+    });
+  }
+
   async function sendQueuedMessageNow(queuedMessageId) {
     if (sendingRef.current || clearingChatRef.current) {
       return;
@@ -4077,6 +4096,15 @@ function App() {
           ) : null}
 
           <form className="chat-input" onSubmit={sendMessage}>
+            <button
+              type="button"
+              className="next-chunk-btn"
+              onClick={sendNextChunk}
+              disabled={!hasDeck || sending || clearingChat}
+              title="Send 'Next chunk'"
+            >
+              Next Chunk
+            </button>
             <textarea
               ref={inputRef}
               value={inputValue}

@@ -36,10 +36,15 @@ class DeckRecord:
     deck_id: str
     filename: str
     source_path: Path
-    pdf_path: Path
+    pdf_path: Path | None
     slide_count: int
     narrate_enabled: bool
     slide_text: list[str]
+    content_type: Literal["pdf", "url"] = "pdf"
+    source_url: str | None = None
+    section_html: list[str] = field(default_factory=list)
+    section_headings: list[str] = field(default_factory=list)
+    full_text: str = ""
     transcript_cache_key: str | None = None
     transcript_status: Literal["queued", "generating", "completed", "error", "disabled"] = "queued"
     transcript_error: str | None = None
@@ -54,6 +59,8 @@ class DeckRecord:
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def get_pdf_base64(self) -> str:
+        if self.content_type == "url" or self.pdf_path is None:
+            raise DeckValidationError("PDF not available for URL-based content")
         with self.lock:
             if self._pdf_base64 is None:
                 self._pdf_base64 = base64.standard_b64encode(self.pdf_path.read_bytes()).decode("utf-8")
@@ -295,6 +302,8 @@ class DeckService:
 
     def render_slide_png(self, deck_id: str, slide_index: int, scale: float = 2.0) -> bytes:
         deck = self.get_deck(deck_id)
+        if deck.content_type == "url":
+            raise DeckValidationError("Image rendering not supported for URL content")
         if slide_index < 0 or slide_index >= deck.slide_count:
             raise IndexError(f"Slide index out of range: {slide_index}")
 
@@ -303,6 +312,112 @@ class DeckService:
             matrix = fitz.Matrix(scale, scale)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             return pix.tobytes("png")
+
+    def create_deck_from_url(self, url: str, narrate_enabled: bool = True) -> DeckRecord:
+        """Fetch lecture notes from *url* and create a deck from the parsed sections."""
+        from .url_service import (
+            URLFetchError,
+            URLValidationError,
+            compute_html_content_hash,
+            extract_page_title,
+            fetch_url_content,
+            parse_sections,
+        )
+
+        try:
+            html = fetch_url_content(url)
+        except (URLFetchError, URLValidationError):
+            raise
+        except Exception as exc:
+            raise DeckValidationError(f"Failed to fetch URL: {exc}") from exc
+
+        try:
+            sections = parse_sections(html, url)
+        except URLValidationError:
+            raise
+        except Exception as exc:
+            raise DeckValidationError(f"Failed to parse lecture page: {exc}") from exc
+
+        if not sections:
+            raise DeckValidationError("No content found on the page")
+
+        deck_id = uuid4().hex
+        deck_dir = self.storage_dir / deck_id
+        deck_dir.mkdir(parents=True, exist_ok=False)
+
+        try:
+            source_path = deck_dir / "source.html"
+            source_path.write_text(html, encoding="utf-8")
+
+            content_hash = compute_html_content_hash(html)
+            page_title = extract_page_title(html)
+
+            slide_text = [s.text_content for s in sections]
+            section_html = [s.html_content for s in sections]
+            section_headings = [s.heading_text for s in sections]
+            full_text = "\n\n".join(
+                f"## {s.heading_text}\n{s.text_content}" for s in sections
+            )
+
+            transcript_cache_key = self._build_transcript_cache_key(slide_text) if narrate_enabled else None
+            cached_transcripts = None
+            has_cached_transcripts = False
+            if narrate_enabled and transcript_cache_key:
+                cached_transcripts = self._load_cached_transcripts(
+                    transcript_cache_key,
+                    expected_slide_count=len(slide_text),
+                )
+                has_cached_transcripts = cached_transcripts is not None and len(cached_transcripts) == len(slide_text)
+
+            record = DeckRecord(
+                deck_id=deck_id,
+                filename=page_title,
+                source_path=source_path,
+                pdf_path=None,
+                slide_count=len(sections),
+                narrate_enabled=narrate_enabled,
+                slide_text=slide_text,
+                content_type="url",
+                source_url=url,
+                section_html=section_html,
+                section_headings=section_headings,
+                full_text=full_text,
+                content_hash=content_hash,
+                transcript_cache_key=transcript_cache_key,
+                transcript_status="disabled" if not narrate_enabled else ("completed" if has_cached_transcripts else "queued"),
+                transcripts=cached_transcripts if cached_transcripts is not None else [None] * len(sections),
+                transcript_slide_errors=[None] * len(sections),
+            )
+
+            with self._lock:
+                self._decks[deck_id] = record
+
+            return record
+        except (DeckValidationError, URLFetchError, URLValidationError):
+            shutil.rmtree(deck_dir, ignore_errors=True)
+            raise
+        except Exception as exc:
+            shutil.rmtree(deck_dir, ignore_errors=True)
+            raise DeckValidationError(f"Failed to process URL content: {exc}") from exc
+
+    def list_sections(self, deck_id: str) -> list[dict]:
+        """Return section metadata for a URL-based deck."""
+        deck = self.get_deck(deck_id)
+        if deck.content_type != "url":
+            raise DeckValidationError("Sections are only available for URL content")
+        result = []
+        for index in range(deck.slide_count):
+            text = deck.slide_text[index]
+            preview = " ".join(text.split())[:200]
+            if len(preview) == 200:
+                preview += "..."
+            result.append({
+                "index": index,
+                "heading": deck.section_headings[index] if index < len(deck.section_headings) else "",
+                "text_preview": preview,
+                "html_content": deck.section_html[index] if index < len(deck.section_html) else "",
+            })
+        return result
 
     def clear_chat(self, deck_id: str) -> None:
         deck = self.get_deck(deck_id)

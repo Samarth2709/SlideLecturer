@@ -17,8 +17,8 @@ SYSTEM_PROMPT = _load_prompt("system_prompt.md")
 FOCUS_PROMPT_TEMPLATE = _load_prompt("focus_prompt.md")
 TRANSCRIPT_PROMPT_TEMPLATE = _load_prompt("transcript_prompt.md")
 TRANSCRIPT_SYSTEM_PROMPT = _load_prompt("transcript_system_prompt.md")
-
-
+URL_FOCUS_PROMPT_TEMPLATE = _load_prompt("url_focus_prompt.md")
+URL_TRANSCRIPT_PROMPT_TEMPLATE = _load_prompt("url_transcript_prompt.md")
 
 
 def build_focus_prompt(question: str, slide_number: int) -> str:
@@ -37,4 +37,29 @@ def build_transcript_prompt(
         total_slides=total_slides,
         target_words=target_words,
         slide_text=normalized_slide_text,
+    )
+
+
+def build_url_focus_prompt(question: str, section_heading: str, section_number: int) -> str:
+    return URL_FOCUS_PROMPT_TEMPLATE.format(
+        question=question,
+        section_heading=section_heading,
+        section_number=section_number,
+    )
+
+
+def build_url_transcript_prompt(
+    section_number: int,
+    total_sections: int,
+    target_words: int,
+    section_heading: str,
+    section_text: str,
+) -> str:
+    normalized_text = section_text.strip() if section_text else "(No text found in this section.)"
+    return URL_TRANSCRIPT_PROMPT_TEMPLATE.format(
+        section_number=section_number,
+        total_sections=total_sections,
+        target_words=target_words,
+        section_heading=section_heading,
+        section_text=normalized_text,
     )

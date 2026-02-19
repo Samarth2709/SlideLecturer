@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { visit } from 'unist-util-visit';
+import DOMPurify from 'dompurify';
 
 function remarkCodeBlockDefault() {
   return (tree) => {
@@ -21,7 +22,7 @@ const WELCOME_MESSAGE = {
   id: 'welcome',
   role: 'assistant',
   content:
-    "Hello! I'm your slide assistant. Upload a PDF or PPTX deck, then ask questions about the full deck or focus on one slide.",
+    "Hello! I'm your study assistant. Upload a PDF/PPTX deck or enter a URL to lecture notes, then ask questions about the full content or focus on one slide or section.",
 };
 
 const MAIN_BRANCH_ID = 'branch-main';
@@ -1026,6 +1027,9 @@ function App() {
   const [editingContextIndex, setEditingContextIndex] = useState(null);
   const [expandedContextIndex, setExpandedContextIndex] = useState(null);
   const [contextFileDragActive, setContextFileDragActive] = useState(false);
+  const [urlInput, setUrlInput] = useState('');
+  const [urlLoading, setUrlLoading] = useState(false);
+  const [inputMode, setInputMode] = useState('file'); // 'file' or 'url'
 
   const workspaceRef = useRef(null);
   const slideScrollRef = useRef(null);
@@ -1766,6 +1770,7 @@ function App() {
   }, [isBranchMapOpen]);
 
   const hasDeck = Boolean(deck?.deck_id);
+  const isUrlDeck = deck?.content_type === 'url';
   const isDeckNarrationEnabled = deck?.narrate_enabled !== false;
   const splitPercentage = Number((splitRatio * 100).toFixed(1));
   const transcriptsBySlide = useMemo(() => {
@@ -1982,13 +1987,13 @@ function App() {
 
   const inputPlaceholder = useMemo(() => {
     if (!hasDeck) {
-      return 'Upload a deck first to start asking questions...';
+      return 'Upload a deck or enter a URL to start asking questions...';
     }
     if (focusedSlideIndex !== null) {
-      return `Ask about Slide ${focusedSlideIndex + 1} (focus mode)...`;
+      return `Ask about ${isUrlDeck ? 'Section' : 'Slide'} ${focusedSlideIndex + 1} (focus mode)...`;
     }
-    return 'Ask a question about the slides...';
-  }, [focusedSlideIndex, hasDeck]);
+    return isUrlDeck ? 'Ask a question about the notes...' : 'Ask a question about the slides...';
+  }, [focusedSlideIndex, hasDeck, isUrlDeck]);
 
   async function fetchTranscriptSnapshot(deckId) {
     const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/transcripts`));
@@ -2061,6 +2066,24 @@ function App() {
 
     const data = await response.json();
     setSlides(data.slides || []);
+    setCurrentSlideIndex(0);
+    setFocusedSlideIndex(null);
+  }
+
+  async function fetchSections(deckId) {
+    const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/sections`));
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(extractApiErrorMessage(data, 'Failed to load sections'));
+    }
+    const data = await response.json();
+    const sectionSlides = (data.sections || []).map((s) => ({
+      index: s.index,
+      text_preview: s.text_preview,
+      heading: s.heading,
+      htmlContent: s.html_content,
+    }));
+    setSlides(sectionSlides);
     setCurrentSlideIndex(0);
     setFocusedSlideIndex(null);
   }
@@ -2188,6 +2211,74 @@ function App() {
     }
   }
 
+  async function processUrlInput() {
+    setError('');
+    setUrlLoading(true);
+    resetTranscriptState(0);
+
+    try {
+      if (deck?.deck_id) {
+        await safeDeleteDeck(deck.deck_id);
+      }
+
+      const response = await fetch(apiUrl('/api/v1/decks/ingest-url'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: urlInput.trim(),
+          narrate_enabled: narrateEnabled,
+        }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(extractApiErrorMessage(data, 'Failed to load URL'));
+      }
+
+      const payload = await response.json();
+      setDeck(payload);
+      if (typeof payload?.narrate_enabled === 'boolean') {
+        setNarrateEnabled(payload.narrate_enabled);
+      }
+      if (payload.conversation) {
+        restoreBranches(payload.conversation);
+        const rawEntries = Array.isArray(payload.conversation.context_entries)
+          ? payload.conversation.context_entries
+          : [];
+        const restoredContext = rawEntries
+          .map((e, i) => {
+            if (typeof e === 'string') {
+              return { name: `Entry ${i + 1}`, content: e, type: 'text' };
+            }
+            if (e && typeof e === 'object' && e.content) {
+              return {
+                name: String(e.name || `Entry ${i + 1}`),
+                content: String(e.content),
+                type: e.type === 'file' ? 'file' : 'text',
+              };
+            }
+            return null;
+          })
+          .filter(Boolean);
+        setContextEntries(restoredContext);
+      } else {
+        resetBranches();
+        setContextEntries([]);
+      }
+      resetTranscriptState(payload.slide_count || 0);
+      setInputValue('');
+      await fetchSections(payload.deck_id);
+    } catch (urlError) {
+      setError(normalizeError(urlError, 'Failed to load URL'));
+      setDeck(null);
+      setSlides([]);
+      resetBranches();
+      resetTranscriptState(0);
+    } finally {
+      setUrlLoading(false);
+    }
+  }
+
   function triggerFilePicker() {
     if (uploading || sending) {
       return;
@@ -2264,7 +2355,7 @@ function App() {
   }
 
   function slideImageUrl(index) {
-    if (!deck?.deck_id) {
+    if (!deck?.deck_id || deck?.content_type === 'url') {
       return '';
     }
     return apiUrl(`/api/v1/decks/${deck.deck_id}/slides/${index}/image?scale=2`);
@@ -3557,7 +3648,7 @@ function App() {
       <header className="topbar">
         <h1>Slide Study Studio</h1>
         {deck ? (
-          <p className="topbar-deck-name" title={deck.filename}>
+          <p className="topbar-deck-name" title={deck.source_url || deck.filename}>
             {deck.filename}
           </p>
         ) : null}
@@ -3634,9 +3725,9 @@ function App() {
                       }
                     }}
                     className="slides-search-input"
-                    placeholder="Search slides and transcripts (/)"
+                    placeholder={`Search ${isUrlDeck ? 'sections' : 'slides'} and transcripts (/)`}
                     disabled={!slides.length}
-                    aria-label="Search slides and transcripts"
+                    aria-label={`Search ${isUrlDeck ? 'sections' : 'slides'} and transcripts`}
                     aria-keyshortcuts="/"
                   />
                   {slideSearchQuery.trim() ? (
@@ -3663,7 +3754,7 @@ function App() {
                 <section className="slide-search-results" aria-live="polite">
                   <p className="slide-search-summary">
                     {slideSearchResults.length
-                      ? `${slideSearchResults.length} matching slides`
+                      ? `${slideSearchResults.length} matching ${isUrlDeck ? 'sections' : 'slides'}`
                       : `No matches for "${slideSearchQuery.trim()}"`}
                   </p>
                   {slideSearchResults.length ? (
@@ -3676,7 +3767,7 @@ function App() {
                             onClick={() => jumpToSearchResult(result.slideIndex)}
                           >
                             <span className="slide-search-item-title">
-                              Slide {result.slideIndex + 1} · {result.source}
+                              {isUrlDeck ? 'Section' : 'Slide'} {result.slideIndex + 1} · {result.source}
                               {result.isBookmarked ? ' · Starred' : ''}
                             </span>
                             <span className="slide-search-item-snippet">
@@ -3699,6 +3790,180 @@ function App() {
               >
                 {slides.length ? (
                   slidesToRender.length ? (
+                    isUrlDeck ? (
+                      slidesToRender.map((slide) => {
+                        const isFocused = focusedSlideIndex === slide.index;
+                        const isBookmarked = bookmarkedSlideSet.has(slide.index);
+                        const isTranscriptOpen = activeTranscriptSlideIndex === slide.index;
+                        const slideTranscript = transcriptsBySlide.get(slide.index) || null;
+                        const hasTranscript = Boolean(slideTranscript?.transcript);
+                        const narrationEnabledForDeck = deck?.narrate_enabled !== false;
+                        const isSpeechSelected = activeSpeechSlideIndex === slide.index;
+                        const isSpeechLoading = isSpeechSelected && speechStatus === 'loading';
+                        const isSpeechPlaying = isSpeechSelected && speechStatus === 'playing';
+                        const isSpeechPaused = isSpeechSelected && speechStatus === 'paused';
+                        const isSpeechActive = isSpeechSelected && (isSpeechPlaying || isSpeechPaused);
+                        const canSeekSpeech =
+                          isSpeechSelected && speechStatus !== 'idle' && speechStatus !== 'loading';
+                        const transcriptStatus = slideTranscript?.status || 'pending';
+                        const transcriptButtonLabel = isTranscriptOpen
+                          ? 'Hide'
+                          : !narrationEnabledForDeck
+                            ? 'Narration Off'
+                          : hasTranscript
+                            ? 'Transcript'
+                            : transcriptStatus === 'generating' || transcriptState.status === 'queued'
+                              ? 'Preparing'
+                              : transcriptStatus === 'error'
+                                ? 'Unavailable'
+                                : 'Pending';
+                        return (
+                          <article
+                            key={slide.index}
+                            ref={(node) => {
+                              slideRefs.current[slide.index] = node;
+                            }}
+                            className={`section-card ${isFocused ? 'focused' : ''}`}
+                            onClick={() => toggleFocus(slide.index)}
+                          >
+                            <div className="section-card-header">
+                              <span className="section-number-badge">Section {slide.index + 1}</span>
+                              <button
+                                type="button"
+                                className="section-heading-btn"
+                                onClick={() => toggleFocus(slide.index)}
+                              >
+                                {slide.heading || `Section ${slide.index + 1}`}
+                              </button>
+                              <div className="slide-card-actions">
+                                <button
+                                  type="button"
+                                  className={`slide-bookmark-btn ${isBookmarked ? 'active' : ''}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    toggleBookmark(slide.index);
+                                  }}
+                                  aria-label={`${isBookmarked ? 'Remove' : 'Add'} bookmark for Section ${slide.index + 1}`}
+                                  aria-pressed={isBookmarked}
+                                  title={`${isBookmarked ? 'Remove' : 'Add'} bookmark for Section ${slide.index + 1} (S)`}
+                                  aria-keyshortcuts="s"
+                                >
+                                  <StarIcon />
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`slide-transcript-btn ${hasTranscript ? 'ready' : ''}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    openTranscriptModal(slide.index);
+                                  }}
+                                  aria-label={`${isTranscriptOpen ? 'Hide' : 'Open'} transcript for Section ${slide.index + 1}`}
+                                  title={`${isTranscriptOpen ? 'Hide' : 'Open'} transcript for Section ${slide.index + 1} (T)`}
+                                  aria-keyshortcuts="t"
+                                  disabled={!narrationEnabledForDeck}
+                                >
+                                  {transcriptButtonLabel}
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`slide-speech-btn ${isSpeechActive ? 'active' : ''} ${isSpeechLoading ? 'loading' : ''}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    toggleTranscriptSpeech(slide.index, slideTranscript?.transcript);
+                                  }}
+                                  aria-label={`${isSpeechActive ? 'Pause or resume' : 'Play'} narration for Section ${slide.index + 1}`}
+                                  title={`Play narration for Section ${slide.index + 1}`}
+                                  aria-pressed={isSpeechActive}
+                                  disabled={!hasTranscript || !narrationEnabledForDeck}
+                                >
+                                  <SpeakerIcon />
+                                </button>
+                              </div>
+                            </div>
+                            {isTranscriptOpen ? (
+                              <section
+                                className="slide-transcript-row"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  closeTranscriptModal();
+                                }}
+                              >
+                                <div className="slide-transcript-row-body">
+                                  {hasTranscript ? (
+                                    <p className="slide-transcript-row-text">{slideTranscript.transcript}</p>
+                                  ) : !narrationEnabledForDeck ? (
+                                    <p className="slide-transcript-row-state">
+                                      Narration is disabled for this deck.
+                                    </p>
+                                  ) : transcriptStatus === 'error' ? (
+                                    <p className="slide-transcript-row-state error">
+                                      {slideTranscript?.error || 'Transcript generation failed for this section.'}
+                                    </p>
+                                  ) : transcriptState.status === 'error' ? (
+                                    <p className="slide-transcript-row-state error">
+                                      {transcriptState.error || 'Transcript generation ended with errors.'}
+                                    </p>
+                                  ) : (
+                                    <p className="slide-transcript-row-state">
+                                      Transcript is being prepared for this section.
+                                    </p>
+                                  )}
+                                </div>
+                              </section>
+                            ) : null}
+                            {isSpeechSelected ? (
+                              <section
+                                className="slide-speech-row"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                }}
+                              >
+                                <div className="slide-speech-row-main">
+                                  <div className="slide-speech-row-controls">
+                                    <button
+                                      type="button"
+                                      className="slide-speech-control-btn"
+                                      onClick={() => seekTranscriptSpeechBy(-15)}
+                                      disabled={!canSeekSpeech}
+                                      aria-label={`Jump back 15 seconds for Section ${slide.index + 1} narration`}
+                                    >
+                                      -15s
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="slide-speech-control-btn primary"
+                                      onClick={() => toggleTranscriptSpeech(slide.index, slideTranscript?.transcript)}
+                                      aria-label={`${isSpeechPlaying ? 'Pause' : 'Play'} Section ${slide.index + 1} narration`}
+                                    >
+                                      {isSpeechPlaying ? 'Pause' : isSpeechLoading ? 'Loading' : 'Play'}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="slide-speech-control-btn"
+                                      onClick={() => seekTranscriptSpeechBy(15)}
+                                      disabled={!canSeekSpeech}
+                                      aria-label={`Jump forward 15 seconds for Section ${slide.index + 1} narration`}
+                                    >
+                                      +15s
+                                    </button>
+                                  </div>
+                                  <p className="slide-speech-row-time">
+                                    {formatPlaybackClock(speechCurrentTimeSeconds)} / {formatPlaybackClock(speechDurationSeconds)}
+                                  </p>
+                                </div>
+                                {speechIsBuffering ? (
+                                  <p className="slide-speech-row-state">Buffering narration…</p>
+                                ) : null}
+                              </section>
+                            ) : null}
+                            <div
+                              className="section-html-content"
+                              dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(slide.htmlContent || '') }}
+                            />
+                          </article>
+                        );
+                      })
+                    ) : (
                     slidesToRender.map((slide) => {
                       const isFocused = focusedSlideIndex === slide.index;
                       const isTranscriptOpen = activeTranscriptSlideIndex === slide.index;
@@ -3878,6 +4143,7 @@ function App() {
                         </article>
                       );
                     })
+                    )
                   ) : (
                     <div className="empty-state">
                       <p className="dropzone-title">No starred slides yet</p>
@@ -3885,34 +4151,68 @@ function App() {
                     </div>
                   )
                 ) : (
-                  <div
-                    className={`empty-state upload-dropzone ${isDragActive ? 'drag-over' : ''}`}
-                    onClick={triggerFilePicker}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        triggerFilePicker();
-                      }
-                    }}
-                    onDragEnter={handleDropZoneDragEnter}
-                    onDragOver={handleDropZoneDragOver}
-                    onDragLeave={handleDropZoneDragLeave}
-                    onDrop={handleDropZoneDrop}
-                    role="button"
-                    tabIndex={uploading || sending ? -1 : 0}
-                    aria-disabled={uploading || sending}
-                    aria-label="Upload by dragging and dropping a PDF or PowerPoint, or click to choose a file"
-                  >
-                    <p className="dropzone-title">
-                      {uploading
-                        ? 'Uploading your deck...'
-                        : isDragActive
-                          ? 'Drop your file to upload'
-                          : 'Drag and drop PDF/PowerPoint here'}
-                    </p>
-                    <p className="dropzone-subtitle">
-                      {uploading ? 'Processing slides now.' : 'or click this box to choose a file'}
-                    </p>
+                  <div className="empty-state upload-area">
+                    <div className="input-mode-tabs">
+                      <button
+                        className={`input-tab ${inputMode === 'file' ? 'active' : ''}`}
+                        onClick={() => setInputMode('file')}
+                      >
+                        Upload File
+                      </button>
+                      <button
+                        className={`input-tab ${inputMode === 'url' ? 'active' : ''}`}
+                        onClick={() => setInputMode('url')}
+                      >
+                        Enter URL
+                      </button>
+                    </div>
+                    {inputMode === 'url' ? (
+                      <div className="url-input-area">
+                        <input
+                          type="url"
+                          value={urlInput}
+                          onChange={(e) => setUrlInput(e.target.value)}
+                          placeholder="https://example.com/lecture-notes.html"
+                          disabled={urlLoading}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && urlInput.trim() && !urlLoading) processUrlInput();
+                          }}
+                        />
+                        <button onClick={processUrlInput} disabled={!urlInput.trim() || urlLoading}>
+                          {urlLoading ? 'Loading...' : 'Load Notes'}
+                        </button>
+                      </div>
+                    ) : (
+                      <div
+                        className={`upload-dropzone ${isDragActive ? 'drag-over' : ''}`}
+                        onClick={triggerFilePicker}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            triggerFilePicker();
+                          }
+                        }}
+                        onDragEnter={handleDropZoneDragEnter}
+                        onDragOver={handleDropZoneDragOver}
+                        onDragLeave={handleDropZoneDragLeave}
+                        onDrop={handleDropZoneDrop}
+                        role="button"
+                        tabIndex={uploading || sending ? -1 : 0}
+                        aria-disabled={uploading || sending}
+                        aria-label="Upload by dragging and dropping a PDF or PowerPoint, or click to choose a file"
+                      >
+                        <p className="dropzone-title">
+                          {uploading
+                            ? 'Uploading your deck...'
+                            : isDragActive
+                              ? 'Drop your file to upload'
+                              : 'Drag and drop PDF/PowerPoint here'}
+                        </p>
+                        <p className="dropzone-subtitle">
+                          {uploading ? 'Processing slides now.' : 'or click this box to choose a file'}
+                        </p>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -3920,15 +4220,15 @@ function App() {
               <footer className="slides-footer">
                 {slides.length ? (
                   <p>
-                    Slide {currentSlideIndex + 1} of {slides.length}
-                    {showBookmarkedOnly ? ` · Showing ${slidesToRender.length} starred slides` : ''}
+                    {isUrlDeck ? 'Section' : 'Slide'} {currentSlideIndex + 1} of {slides.length}
+                    {showBookmarkedOnly ? ` · Showing ${slidesToRender.length} starred ${isUrlDeck ? 'sections' : 'slides'}` : ''}
                   </p>
                 ) : (
-                  <p>No slides</p>
+                  <p>No {isUrlDeck ? 'sections' : 'slides'}</p>
                 )}
                 {slides.length ? (
                   <p className="shortcut-hint">
-                    Shortcuts: / search · S star current slide · T transcript · H hide/show slides · Q ask AI
+                    Shortcuts: / search · S star current {isUrlDeck ? 'section' : 'slide'} · T transcript · H hide/show {isUrlDeck ? 'sections' : 'slides'} · Q ask AI
                   </p>
                 ) : null}
               </footer>

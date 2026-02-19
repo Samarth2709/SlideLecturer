@@ -15,6 +15,8 @@ class DeckUploadResponse(BaseModel):
     created_at: datetime
     narrate_enabled: bool
     content_hash: str
+    content_type: str = "pdf"
+    source_url: str | None = None
     conversation: dict | None = None
 
 
@@ -35,6 +37,8 @@ class DeckInfoResponse(BaseModel):
     slide_count: int
     created_at: datetime
     narrate_enabled: bool
+    content_type: str = "pdf"
+    source_url: str | None = None
 
 
 TranscriptGenerationStatus = Literal["queued", "generating", "completed", "error", "disabled"]
@@ -95,6 +99,24 @@ class SaveConversationRequest(BaseModel):
 
 class SaveConversationResponse(BaseModel):
     status: Literal["ok"]
+
+
+class URLIngestRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    narrate_enabled: bool = True
+
+
+class SectionSummary(BaseModel):
+    index: int
+    heading: str
+    text_preview: str
+    html_content: str
+
+
+class DeckSectionsResponse(BaseModel):
+    deck_id: str
+    section_count: int
+    sections: list[SectionSummary]
 
 
 class ErrorResponse(BaseModel):

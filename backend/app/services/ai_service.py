@@ -17,12 +17,19 @@ from ..prompts import (
     TRANSCRIPT_SYSTEM_PROMPT,
     build_focus_prompt,
     build_transcript_prompt,
+    build_url_focus_prompt,
+    build_url_transcript_prompt,
 )
-from .content_tools import ALL_TOOLS, ContentToolResolver
+from .content_tools import ContentToolResolver, get_tools
+from .url_service import extract_images_from_html, fetch_image_as_base64
 from .deck_service import DeckNotFoundError, DeckRecord, DeckService
 
 _MAX_TOOL_ROUNDS = 5
-_TOOL_INDICATOR_RE = re.compile(r"\n*> \*(?:Listing additional content|Reading \"[^\"]*\"|Using [^*]*)\.{3}\*\n*")
+_TOOL_INDICATOR_RE = re.compile(
+    r"\n*> \*(?:Listing additional content|Reading \"[^\"]*\"|"
+    r"Listing (?:section )?images[^*]*|Viewing section image|"
+    r"Using [^*]*)\.{3}\*\n*"
+)
 
 
 class AIService:
@@ -68,7 +75,16 @@ class AIService:
             yield "[Error: AI service not available. Set ANTHROPIC_API_KEY.]"
             return
 
-        if deck.slide_count > settings.max_pdf_pages:
+        _MAX_URL_TEXT_CHARS = 200_000
+
+        if deck.content_type == "url" and len(deck.full_text) > _MAX_URL_TEXT_CHARS:
+            yield (
+                f"[Error: Lecture content is too large ({len(deck.full_text)} characters, "
+                f"max {_MAX_URL_TEXT_CHARS}) for the AI service.]"
+            )
+            return
+
+        if deck.content_type == "pdf" and deck.slide_count > settings.max_pdf_pages:
             yield (
                 f"[Error: Deck has {deck.slide_count} pages, which exceeds the limit of "
                 f"{settings.max_pdf_pages} pages supported by the AI service.]"
@@ -92,30 +108,90 @@ class AIService:
         messages = self._build_history_messages(normalized_history)
         user_content: list[dict] = []
 
-        # Keep deck context as a single prior conversation message when history exists.
-        if history is not None:
-            if not messages:
-                user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
-            elif not self._attach_pdf_to_first_user_message(messages, deck.get_pdf_base64()):
-                user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
+        if deck.content_type == "url":
+            # For URL-based content, send full lecture text instead of PDF.
+            lecture_block = self._build_text_block(
+                f"<lecture_content>\n{deck.full_text}\n</lecture_content>"
+            )
+            lecture_block["cache_control"] = {"type": "ephemeral"}
+            if history is not None:
+                if not messages:
+                    user_content.append(lecture_block)
+                elif not self._attach_text_context_to_first_user_message(messages, lecture_block):
+                    user_content.append(lecture_block)
+            else:
+                with deck.lock:
+                    is_first_message = deck.is_first_message
+                if is_first_message:
+                    user_content.append(lecture_block)
         else:
-            with deck.lock:
-                is_first_message = deck.is_first_message
-            if is_first_message:
-                user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
+            # Keep deck context as a single prior conversation message when history exists.
+            if history is not None:
+                if not messages:
+                    user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
+                elif not self._attach_pdf_to_first_user_message(messages, deck.get_pdf_base64()):
+                    user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
+            else:
+                with deck.lock:
+                    is_first_message = deck.is_first_message
+                if is_first_message:
+                    user_content.append(self._build_pdf_document_block(deck.get_pdf_base64(), with_cache=True))
 
-        resolver = ContentToolResolver(additional_content or [])
-        tools = ALL_TOOLS if resolver.has_content() else None
+        resolver = ContentToolResolver(
+            additional_content or [],
+            deck=deck if deck.content_type == "url" and focused_slide_index is None else None,
+        )
+        tools = get_tools(
+            has_additional_content=resolver.has_additional_content(),
+            has_url_images=resolver.has_url_images(),
+        )
 
         if resolver.has_content():
             user_content.append(self._build_text_block(resolver.content_names_summary()))
 
         prompt_text = question
         if focused_slide_index is not None:
-            slide_number = focused_slide_index + 1
-            focus_png = self.deck_service.render_slide_png(deck.deck_id, focused_slide_index, scale=2.0)
-            user_content.append(self._build_image_block(base64.b64encode(focus_png).decode("utf-8")))
-            prompt_text = build_focus_prompt(question, slide_number)
+            if deck.content_type == "url":
+                # For URL content, send focused section text instead of image.
+                section_text = deck.slide_text[focused_slide_index] if focused_slide_index < len(deck.slide_text) else ""
+                section_heading = deck.section_headings[focused_slide_index] if focused_slide_index < len(deck.section_headings) else ""
+                safe_heading = section_heading.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+                user_content.append(self._build_text_block(
+                    f"<focused_section heading=\"{safe_heading}\">\n{section_text}\n</focused_section>"
+                ))
+                # Attach images from the focused section.
+                _MAX_FOCUS_IMAGES = 5
+                if focused_slide_index < len(deck.section_html):
+                    section_images = extract_images_from_html(
+                        deck.section_html[focused_slide_index],
+                        section_index=focused_slide_index,
+                    )
+                    attached = 0
+                    for img_info in section_images:
+                        if attached >= _MAX_FOCUS_IMAGES:
+                            user_content.append(self._build_text_block(
+                                f"({len(section_images) - attached} more image(s) in this section omitted.)"
+                            ))
+                            break
+                        img_result = fetch_image_as_base64(img_info.url)
+                        if img_result is None:
+                            continue
+                        b64_data, media_type = img_result
+                        user_content.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64_data,
+                            },
+                        })
+                        attached += 1
+                prompt_text = build_url_focus_prompt(question, section_heading, focused_slide_index + 1)
+            else:
+                slide_number = focused_slide_index + 1
+                focus_png = self.deck_service.render_slide_png(deck.deck_id, focused_slide_index, scale=2.0)
+                user_content.append(self._build_image_block(base64.b64encode(focus_png).decode("utf-8")))
+                prompt_text = build_focus_prompt(question, slide_number)
 
         user_content.append(self._build_text_block(prompt_text))
 
@@ -242,32 +318,35 @@ class AIService:
                 return
             return
 
-        if deck.slide_count > settings.max_pdf_pages:
-            try:
-                self.deck_service.mark_transcript_generation_error(
-                    deck_id,
-                    (
-                        f"Deck has {deck.slide_count} pages, which exceeds the configured limit of "
-                        f"{settings.max_pdf_pages} pages."
-                    ),
-                )
-            except DeckNotFoundError:
+        pdf_base64: str | None = None
+        if deck.content_type == "pdf":
+            if deck.slide_count > settings.max_pdf_pages:
+                try:
+                    self.deck_service.mark_transcript_generation_error(
+                        deck_id,
+                        (
+                            f"Deck has {deck.slide_count} pages, which exceeds the configured limit of "
+                            f"{settings.max_pdf_pages} pages."
+                        ),
+                    )
+                except DeckNotFoundError:
+                    return
                 return
-            return
 
-        try:
-            pdf_base64 = deck.get_pdf_base64()
-        except FileNotFoundError:
             try:
-                self.deck_service.mark_transcript_generation_error(
-                    deck_id,
-                    "Deck files are no longer available for transcript generation.",
-                )
-            except DeckNotFoundError:
+                pdf_base64 = deck.get_pdf_base64()
+            except Exception:
+                try:
+                    self.deck_service.mark_transcript_generation_error(
+                        deck_id,
+                        "Deck files are no longer available for transcript generation.",
+                    )
+                except DeckNotFoundError:
+                    return
                 return
-            return
 
         slide_errors: list[str] = []
+        unit_label = "Section" if deck.content_type == "url" else "Slide"
 
         for slide_index in range(deck.slide_count):
             try:
@@ -287,13 +366,13 @@ class AIService:
                     self.deck_service.mark_transcript_slide_error(deck_id, slide_index, error_text)
                 except DeckNotFoundError:
                     return
-                slide_errors.append(f"Slide {slide_index + 1}: {error_text}")
+                slide_errors.append(f"{unit_label} {slide_index + 1}: {error_text}")
 
         try:
             if slide_errors:
                 summary = "; ".join(slide_errors[:3])
                 if len(slide_errors) > 3:
-                    summary += f"; ... ({len(slide_errors) - 3} additional slide errors)"
+                    summary += f"; ... ({len(slide_errors) - 3} additional errors)"
                 self.deck_service.mark_transcript_generation_error(
                     deck_id,
                     f"Transcript generation completed with errors. {summary}",
@@ -308,7 +387,7 @@ class AIService:
         deck: DeckRecord,
         slide_index: int,
         target_words: int,
-        pdf_base64: str,
+        pdf_base64: str | None,
     ) -> str:
         if not self.client:
             raise RuntimeError("AI service not available.")
@@ -316,17 +395,34 @@ class AIService:
         slide_text = self.deck_service.get_slide_text(deck.deck_id, slide_index)
         slide_text = slide_text[:8000]
 
-        prompt_text = build_transcript_prompt(
-            slide_number=slide_index + 1,
-            total_slides=deck.slide_count,
-            target_words=target_words,
-            slide_text=slide_text,
-        )
-
-        user_content = [
-            self._build_pdf_document_block(pdf_base64, with_cache=True),
-            self._build_text_block(prompt_text),
-        ]
+        if deck.content_type == "url":
+            section_heading = deck.section_headings[slide_index] if slide_index < len(deck.section_headings) else ""
+            prompt_text = build_url_transcript_prompt(
+                section_number=slide_index + 1,
+                total_sections=deck.slide_count,
+                target_words=target_words,
+                section_heading=section_heading,
+                section_text=slide_text,
+            )
+            lecture_block = self._build_text_block(
+                f"<lecture_content>\n{deck.full_text}\n</lecture_content>"
+            )
+            lecture_block["cache_control"] = {"type": "ephemeral"}
+            user_content = [
+                lecture_block,
+                self._build_text_block(prompt_text),
+            ]
+        else:
+            prompt_text = build_transcript_prompt(
+                slide_number=slide_index + 1,
+                total_slides=deck.slide_count,
+                target_words=target_words,
+                slide_text=slide_text,
+            )
+            user_content = [
+                self._build_pdf_document_block(pdf_base64, with_cache=True),
+                self._build_text_block(prompt_text),
+            ]
 
         response = self.client.messages.create(
             model=settings.transcript_model_name,
@@ -348,6 +444,13 @@ class AIService:
         if tool_name == "get_additional_content":
             name = tool_input.get("name", "")
             return f"Reading \"{name}\"..." if name else "Reading additional content..."
+        if tool_name == "list_section_images":
+            section = tool_input.get("section_index")
+            if section is not None:
+                return f"Listing images in section {section + 1}..."
+            return "Listing section images..."
+        if tool_name == "get_section_image":
+            return "Viewing section image..."
         return f"Using {tool_name}..."
 
     @staticmethod
@@ -411,6 +514,19 @@ class AIService:
                 }
             )
         return messages
+
+    def _attach_text_context_to_first_user_message(self, messages: list[dict], text_block: dict) -> bool:
+        """Insert a cached text context block at the start of the first user message."""
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                content = [self._build_text_block(str(content or ""))]
+            content.insert(0, text_block)
+            message["content"] = content
+            return True
+        return False
 
     def _attach_pdf_to_first_user_message(self, messages: list[dict], pdf_base64: str) -> bool:
         for message in messages:

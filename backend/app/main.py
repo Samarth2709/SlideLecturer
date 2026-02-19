@@ -16,16 +16,20 @@ from .models import (
     ChatStreamRequest,
     ClearChatResponse,
     DeckInfoResponse,
+    DeckSectionsResponse,
     DeckSlidesResponse,
     DeckTranscriptsResponse,
     DeckUploadResponse,
     DeleteDeckResponse,
     SaveConversationRequest,
     SaveConversationResponse,
+    SectionSummary,
     SlideSummary,
+    URLIngestRequest,
 )
 from .services.ai_service import AIService
 from .services.deck_service import DeckNotFoundError, DeckService, DeckValidationError
+from .services.url_service import URLFetchError, URLValidationError
 from .services.tts_service import ElevenLabsTTSService, TTSConfigurationError, TTSProviderError
 
 
@@ -172,6 +176,35 @@ def upload_deck(
         created_at=record.created_at,
         narrate_enabled=record.narrate_enabled,
         content_hash=record.content_hash,
+        content_type=record.content_type,
+        source_url=record.source_url,
+        conversation=conversation,
+    )
+
+
+@app.post("/api/v1/decks/ingest-url", response_model=DeckUploadResponse)
+def ingest_url(body: URLIngestRequest) -> DeckUploadResponse:
+    try:
+        record = deck_service.create_deck_from_url(body.url, narrate_enabled=body.narrate_enabled)
+    except (URLFetchError, URLValidationError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DeckValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if record.narrate_enabled:
+        ai_service.start_transcript_generation(record.deck_id, target_words=175)
+
+    conversation = deck_service.load_conversation(record.content_hash)
+
+    return DeckUploadResponse(
+        deck_id=record.deck_id,
+        filename=record.filename,
+        slide_count=record.slide_count,
+        created_at=record.created_at,
+        narrate_enabled=record.narrate_enabled,
+        content_hash=record.content_hash,
+        content_type=record.content_type,
+        source_url=record.source_url,
         conversation=conversation,
     )
 
@@ -189,6 +222,8 @@ def get_deck(deck_id: str) -> DeckInfoResponse:
         slide_count=deck.slide_count,
         created_at=deck.created_at,
         narrate_enabled=deck.narrate_enabled,
+        content_type=deck.content_type,
+        source_url=deck.source_url,
     )
 
 
@@ -204,6 +239,24 @@ def get_slides(deck_id: str) -> DeckSlidesResponse:
         deck_id=deck_id,
         slide_count=deck.slide_count,
         slides=[SlideSummary(**slide) for slide in slides_raw],
+    )
+
+
+@app.get("/api/v1/decks/{deck_id}/sections", response_model=DeckSectionsResponse)
+def get_sections(deck_id: str) -> DeckSectionsResponse:
+    try:
+        deck = deck_service.get_deck(deck_id)
+    except DeckNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Deck not found") from exc
+
+    if deck.content_type != "url":
+        raise HTTPException(status_code=400, detail="Sections are only available for URL content")
+
+    sections_raw = deck_service.list_sections(deck_id)
+    return DeckSectionsResponse(
+        deck_id=deck_id,
+        section_count=deck.slide_count,
+        sections=[SectionSummary(**s) for s in sections_raw],
     )
 
 
@@ -239,6 +292,8 @@ def get_slide_image(
         png_bytes = deck_service.render_slide_png(deck_id, slide_index, scale=scale)
     except DeckNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Deck not found") from exc
+    except DeckValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except IndexError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

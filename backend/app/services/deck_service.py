@@ -53,6 +53,7 @@ class DeckRecord:
     transcript_slide_errors: list[str | None] = field(default_factory=list)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     content_hash: str = ""
+    source_files: list[dict] = field(default_factory=list)
     conversation_history: list[dict] = field(default_factory=list)
     is_first_message: bool = True
     _pdf_base64: str | None = None
@@ -133,6 +134,126 @@ class DeckService:
                 self._decks[deck_id] = record
 
             self._add_to_manifest(record)
+            return record
+        except DeckValidationError:
+            shutil.rmtree(deck_dir, ignore_errors=True)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            shutil.rmtree(deck_dir, ignore_errors=True)
+            raise DeckValidationError(f"Failed to process deck: {exc}") from exc
+
+    def create_multi_deck(
+        self,
+        files: list[tuple[str, BinaryIO]],
+        narrate_enabled: bool = True,
+    ) -> DeckRecord:
+        """Create a single combined deck from multiple files (PDF/PPTX)."""
+        if len(files) == 1:
+            return self.create_deck(files[0][0], files[0][1], narrate_enabled=narrate_enabled)
+
+        deck_id = uuid4().hex
+        deck_dir = self.storage_dir / deck_id
+        deck_dir.mkdir(parents=True, exist_ok=False)
+
+        try:
+            pdf_paths: list[Path] = []
+            slide_texts_per_file: list[tuple[str, list[str]]] = []
+            content_hash_digest = hashlib.sha256()
+            filenames: list[str] = []
+
+            for i, (filename, content_stream) in enumerate(files):
+                suffix = Path(filename).suffix.lower()
+                if suffix not in SUPPORTED_EXTENSIONS:
+                    allowed = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+                    raise DeckValidationError(
+                        f"Unsupported file type '{suffix}' for '{filename}'. Allowed: {allowed}"
+                    )
+
+                filenames.append(filename)
+                source_path = deck_dir / f"source_{i}{suffix}"
+                with source_path.open("wb") as target:
+                    shutil.copyfileobj(content_stream, target)
+
+                content_hash_digest.update(source_path.read_bytes())
+
+                if suffix == ".pdf":
+                    pdf_path = source_path
+                else:
+                    pdf_path = self._convert_powerpoint_to_pdf(source_path, deck_dir)
+
+                pdf_paths.append(pdf_path)
+                slide_texts_per_file.append((filename, self._extract_slide_text(pdf_path)))
+
+            content_hash = content_hash_digest.hexdigest()
+
+            # Merge all PDFs into a single deck.pdf
+            merged_pdf_path = deck_dir / "deck.pdf"
+            merged_doc = fitz.open()
+            for pdf_path in pdf_paths:
+                with fitz.open(str(pdf_path)) as doc:
+                    merged_doc.insert_pdf(doc)
+            merged_doc.save(str(merged_pdf_path))
+            merged_doc.close()
+
+            # Combine slide texts and build source file index
+            all_slide_text: list[str] = []
+            source_files: list[dict] = []
+            offset = 0
+            for filename, texts in slide_texts_per_file:
+                source_files.append({
+                    "filename": filename,
+                    "start_slide": offset,
+                    "slide_count": len(texts),
+                })
+                all_slide_text.extend(texts)
+                offset += len(texts)
+
+            # Build display filename
+            if len(filenames) <= 2:
+                display_filename = ", ".join(filenames)
+            else:
+                display_filename = f"{filenames[0]}, {filenames[1]} (+{len(filenames) - 2} more)"
+
+            transcript_cache_key = (
+                self._build_transcript_cache_key(all_slide_text) if narrate_enabled else None
+            )
+            cached_transcripts = None
+            has_cached_transcripts = False
+            if narrate_enabled and transcript_cache_key:
+                cached_transcripts = self._load_cached_transcripts(
+                    transcript_cache_key, expected_slide_count=len(all_slide_text)
+                )
+                has_cached_transcripts = (
+                    cached_transcripts is not None and len(cached_transcripts) == len(all_slide_text)
+                )
+
+            record = DeckRecord(
+                deck_id=deck_id,
+                filename=display_filename,
+                source_path=merged_pdf_path,
+                pdf_path=merged_pdf_path,
+                slide_count=len(all_slide_text),
+                narrate_enabled=narrate_enabled,
+                slide_text=all_slide_text,
+                content_hash=content_hash,
+                source_files=source_files,
+                transcript_cache_key=transcript_cache_key,
+                transcript_status=(
+                    "disabled"
+                    if not narrate_enabled
+                    else ("completed" if has_cached_transcripts else "queued")
+                ),
+                transcripts=(
+                    cached_transcripts
+                    if cached_transcripts is not None
+                    else [None] * len(all_slide_text)
+                ),
+                transcript_slide_errors=[None] * len(all_slide_text),
+            )
+
+            with self._lock:
+                self._decks[deck_id] = record
+
             return record
         except DeckValidationError:
             shutil.rmtree(deck_dir, ignore_errors=True)

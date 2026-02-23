@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
+import 'katex/dist/katex.min.css';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import { visit } from 'unist-util-visit';
@@ -916,7 +919,7 @@ function MessageBubble({
             rows={Math.min(14, Math.max(4, editDraft.split('\n').length + 1))}
           />
         ) : message.role === 'assistant' ? (
-          <ReactMarkdown remarkPlugins={[remarkGfm, remarkCodeBlockDefault]} components={markdownComponents}>{normalizedAssistantMarkdown}</ReactMarkdown>
+          <ReactMarkdown remarkPlugins={[remarkGfm, remarkCodeBlockDefault, remarkMath]} rehypePlugins={[rehypeKatex]} components={markdownComponents}>{normalizedAssistantMarkdown}</ReactMarkdown>
         ) : (
           <p>{message.content}</p>
         )}
@@ -1033,6 +1036,7 @@ function App() {
   const [historyEntries, setHistoryEntries] = useState([]);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [activeFileTabIndex, setActiveFileTabIndex] = useState(null);
 
   const workspaceRef = useRef(null);
   const slideScrollRef = useRef(null);
@@ -1818,12 +1822,24 @@ function App() {
     () => new Set(bookmarkedSlideIndices),
     [bookmarkedSlideIndices]
   );
-  const slidesToRender = useMemo(() => {
-    if (!showBookmarkedOnly) {
+  const tabFilteredSlides = useMemo(() => {
+    const sourceFiles = deck?.source_files;
+    if (!sourceFiles || sourceFiles.length <= 1 || activeFileTabIndex === null) {
       return slides;
     }
-    return slides.filter((slide) => bookmarkedSlideSet.has(slide.index));
-  }, [bookmarkedSlideSet, showBookmarkedOnly, slides]);
+    const tab = sourceFiles[activeFileTabIndex];
+    if (!tab) return slides;
+    const start = tab.start_slide;
+    const end = start + tab.slide_count;
+    return slides.filter((slide) => slide.index >= start && slide.index < end);
+  }, [slides, deck, activeFileTabIndex]);
+
+  const slidesToRender = useMemo(() => {
+    if (!showBookmarkedOnly) {
+      return tabFilteredSlides;
+    }
+    return tabFilteredSlides.filter((slide) => bookmarkedSlideSet.has(slide.index));
+  }, [bookmarkedSlideSet, showBookmarkedOnly, tabFilteredSlides]);
   const navigableSlideIndices = useMemo(
     () => slidesToRender.map((slide) => slide.index),
     [slidesToRender]
@@ -1839,7 +1855,7 @@ function App() {
 
     const results = [];
 
-    for (const slide of slides) {
+    for (const slide of tabFilteredSlides) {
       const slideIndex = slide.index;
       const transcriptEntry = transcriptsBySlide.get(slideIndex);
       const transcript = String(transcriptEntry?.transcript || '');
@@ -1893,7 +1909,7 @@ function App() {
     });
 
     return results.slice(0, 30);
-  }, [bookmarkedSlideSet, normalizedSlideSearchQuery, slides, transcriptsBySlide]);
+  }, [bookmarkedSlideSet, normalizedSlideSearchQuery, tabFilteredSlides, transcriptsBySlide]);
 
   useEffect(() => {
     const totalSlides = Number(deck?.slide_count || 0);
@@ -2169,14 +2185,16 @@ function App() {
     }
   }
 
-  async function processUploadFile(file) {
+  async function processUploadFiles(files) {
     setError('');
     setUploading(true);
     resetTranscriptState(0);
 
     try {
       const form = new FormData();
-      form.append('file', file);
+      for (const file of files) {
+        form.append('files', file);
+      }
       form.append('narrate_enabled', String(narrateEnabled));
 
       const response = await fetch(apiUrl('/api/v1/decks/upload'), {
@@ -2191,6 +2209,7 @@ function App() {
 
       const payload = await response.json();
       setDeck(payload);
+      setActiveFileTabIndex(null);
       if (typeof payload?.narrate_enabled === 'boolean') {
         setNarrateEnabled(payload.narrate_enabled);
       }
@@ -2407,9 +2426,9 @@ function App() {
   }
 
   async function handleFileInputChange(event) {
-    const file = event.target.files?.[0];
-    if (file) {
-      await processUploadFile(file);
+    const files = Array.from(event.target.files || []);
+    if (files.length > 0) {
+      await processUploadFiles(files);
     }
     event.target.value = '';
   }
@@ -2462,16 +2481,14 @@ function App() {
     event.preventDefault();
     event.stopPropagation();
 
-    const file = event.dataTransfer.files?.[0];
+    const files = Array.from(event.dataTransfer.files || []);
     resetDropState();
 
-    if (uploading || sending || file == null) {
+    if (uploading || sending || files.length === 0) {
       return;
     }
 
-    if (file) {
-      await processUploadFile(file);
-    }
+    await processUploadFiles(files);
   }
 
   function slideImageUrl(index) {
@@ -3290,7 +3307,7 @@ function App() {
 
     setError('');
     const branchHistory = branchSnapshot.messages
-      .filter((message) => message.id !== WELCOME_MESSAGE.id)
+      .filter((message) => message.id !== WELCOME_MESSAGE.id && message.content?.trim())
       .slice(-MAX_CHAT_HISTORY_MESSAGES)
       .map((message) => ({
         role: message.role,
@@ -3830,6 +3847,7 @@ function App() {
           className="hidden-file-input"
           type="file"
           accept=".pdf,.ppt,.pptx"
+          multiple
           onChange={handleFileInputChange}
           disabled={uploading || sending}
         />
@@ -3841,6 +3859,28 @@ function App() {
         {slidesVisible ? (
           <>
             <section className="slides-panel" style={slidesPaneStyle}>
+              {deck?.source_files?.length > 1 ? (
+                <div className="file-tabs">
+                  <button
+                    type="button"
+                    className={`file-tab ${activeFileTabIndex === null ? 'active' : ''}`}
+                    onClick={() => setActiveFileTabIndex(null)}
+                  >
+                    All
+                  </button>
+                  {deck.source_files.map((file, index) => (
+                    <button
+                      key={index}
+                      type="button"
+                      className={`file-tab ${activeFileTabIndex === index ? 'active' : ''}`}
+                      onClick={() => setActiveFileTabIndex(index)}
+                      title={file.filename}
+                    >
+                      {file.filename.replace(/\.[^/.]+$/, '')}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               <div className="slides-toolbar">
                 <div className="slides-toolbar-main">
                   <button
@@ -4372,17 +4412,17 @@ function App() {
                         role="button"
                         tabIndex={uploading || sending ? -1 : 0}
                         aria-disabled={uploading || sending}
-                        aria-label="Upload by dragging and dropping a PDF or PowerPoint, or click to choose a file"
+                        aria-label="Upload by dragging and dropping one or more PDFs or PowerPoint files, or click to choose files"
                       >
                         <p className="dropzone-title">
                           {uploading
                             ? 'Uploading your deck...'
                             : isDragActive
-                              ? 'Drop your file to upload'
-                              : 'Drag and drop PDF/PowerPoint here'}
+                              ? 'Drop files to upload'
+                              : 'Drag and drop PDF/PowerPoint files here'}
                         </p>
                         <p className="dropzone-subtitle">
-                          {uploading ? 'Processing slides now.' : 'or click this box to choose a file'}
+                          {uploading ? 'Processing slides now.' : 'or click to choose files — select multiple to combine'}
                         </p>
                       </div>
                     )}

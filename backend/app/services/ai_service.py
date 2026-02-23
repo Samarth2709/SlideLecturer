@@ -11,6 +11,12 @@ from typing import Any, Generator
 
 from anthropic import Anthropic, NOT_GIVEN
 
+try:
+    from rlm import RLM as _RLM
+    _RLM_AVAILABLE = True
+except ImportError:
+    _RLM_AVAILABLE = False
+
 from ..config import settings
 from ..prompts import (
     SYSTEM_PROMPT,
@@ -75,6 +81,127 @@ class AIService:
             yield "[Error: AI service not available. Set ANTHROPIC_API_KEY.]"
             return
 
+        # Use RLM when available: handles unlimited slides across multiple files.
+        # Fall back to direct Anthropic streaming when RLM is not installed.
+        if _RLM_AVAILABLE:
+            yield from self._stream_answer_rlm(
+                deck=deck,
+                question=question,
+                focused_slide_index=focused_slide_index,
+                history=history,
+            )
+        else:
+            yield from self._stream_answer_direct(
+                deck=deck,
+                question=question,
+                focused_slide_index=focused_slide_index,
+                history=history,
+                additional_content=additional_content,
+            )
+
+    def _stream_answer_rlm(
+        self,
+        deck: DeckRecord,
+        question: str,
+        focused_slide_index: int | None,
+        history: list[dict[str, str]] | None = None,
+    ) -> Generator[str, None, None]:
+        """Answer using full slide text corpus with direct Anthropic streaming.
+
+        Sends all extracted slide text as context instead of the PDF binary,
+        which avoids the 100-page limit and works across multiple merged files
+        while preserving true token-by-token streaming.
+        """
+        corpus_block = self._build_text_block(self._build_slide_corpus(deck))
+
+        if history is not None:
+            normalized_history = [
+                {"role": entry["role"], "content": entry["content"]}
+                for entry in history[-20:]
+                if entry.get("role") in {"user", "assistant"} and entry.get("content")
+            ]
+        else:
+            normalized_history = []
+
+        messages = self._build_history_messages(normalized_history)
+        user_content: list[dict] = []
+
+        # Attach corpus to first user message in history, or to the current turn.
+        if not messages:
+            user_content.append(corpus_block)
+        elif not self._attach_block_to_first_user_message(messages, corpus_block):
+            user_content.append(corpus_block)
+
+        prompt_text = question
+        if focused_slide_index is not None:
+            prompt_text = build_focus_prompt(question, focused_slide_index + 1)
+        user_content.append(self._build_text_block(prompt_text))
+
+        messages = messages + [{"role": "user", "content": user_content}]
+
+        full_response = ""
+        try:
+            with self.client.messages.stream(
+                model=settings.model_name,
+                max_tokens=2048,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+            ) as stream:
+                for text in stream.text_stream:
+                    full_response += text
+                    yield text
+        except Exception as exc:  # noqa: BLE001
+            self._log_provider_error(deck.deck_id, str(exc))
+            yield f"[Error: {exc}]"
+            return
+
+        self._log_provider_response(deck.deck_id, full_response)
+
+    def _build_slide_corpus(self, deck: DeckRecord) -> str:
+        """Build a structured text representation of all slide content."""
+        parts = [f"Deck: {deck.filename} \u2014 {deck.slide_count} slides"]
+        if deck.source_files:
+            parts.append("Source files:")
+            for sf in deck.source_files:
+                end = sf["start_slide"] + sf["slide_count"]
+                parts.append(f"  - {sf['filename']}: slides {sf['start_slide'] + 1}\u2013{end}")
+        parts.append("")
+        for i, text in enumerate(deck.slide_text):
+            label = f"--- Slide {i + 1}"
+            if deck.source_files:
+                for sf in deck.source_files:
+                    if sf["start_slide"] <= i < sf["start_slide"] + sf["slide_count"]:
+                        label += f" ({sf['filename']})"
+                        break
+            label += " ---"
+            parts.append(label)
+            parts.append(text.strip() or "(no text content)")
+            parts.append("")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _attach_block_to_first_user_message(messages: list[dict], block: dict) -> bool:
+        """Prepend a content block to the first user message. Returns True on success."""
+        for message in messages:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                content = [{"type": "text", "text": str(content or "")}]
+            content.insert(0, block)
+            message["content"] = content
+            return True
+        return False
+
+    def _stream_answer_direct(
+        self,
+        deck: DeckRecord,
+        question: str,
+        focused_slide_index: int | None,
+        history: list[dict[str, str]] | None = None,
+        additional_content: list[dict[str, Any]] | None = None,
+    ) -> Generator[str, None, None]:
+        """Answer using direct Anthropic streaming API (requires PDF within page limit)."""
         _MAX_URL_TEXT_CHARS = 200_000
 
         if deck.content_type == "url" and len(deck.full_text) > _MAX_URL_TEXT_CHARS:
@@ -84,10 +211,10 @@ class AIService:
             )
             return
 
-        if deck.content_type == "pdf" and deck.slide_count > settings.max_pdf_pages:
+        if deck.slide_count > settings.max_pdf_pages:
             yield (
                 f"[Error: Deck has {deck.slide_count} pages, which exceeds the limit of "
-                f"{settings.max_pdf_pages} pages supported by the AI service.]"
+                f"{settings.max_pdf_pages} pages. Install rlms for unlimited slide support.]"
             )
             return
 

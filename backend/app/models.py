@@ -18,6 +18,7 @@ class DeckUploadResponse(BaseModel):
     content_type: str = "pdf"
     source_url: str | None = None
     conversation: dict | None = None
+    source_files: list[dict] = []
 
 
 class SlideSummary(BaseModel):

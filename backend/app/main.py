@@ -8,6 +8,7 @@ from uuid import uuid4
 from collections.abc import Generator
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 
@@ -156,14 +157,22 @@ def healthcheck() -> str:
 
 @app.post("/api/v1/decks/upload", response_model=DeckUploadResponse)
 def upload_deck(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
     narrate_enabled: bool = Form(default=True),
 ) -> DeckUploadResponse:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Missing filename")
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    for f in files:
+        if not f.filename:
+            raise HTTPException(status_code=400, detail="One or more files is missing a filename")
 
     try:
-        record = deck_service.create_deck(file.filename, file.file, narrate_enabled=narrate_enabled)
+        if len(files) == 1:
+            record = deck_service.create_deck(files[0].filename, files[0].file, narrate_enabled=narrate_enabled)
+        else:
+            file_list = [(f.filename, f.file) for f in files]
+            record = deck_service.create_multi_deck(file_list, narrate_enabled=narrate_enabled)
     except DeckValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -182,6 +191,7 @@ def upload_deck(
         content_type=record.content_type,
         source_url=record.source_url,
         conversation=conversation,
+        source_files=record.source_files,
     )
 
 

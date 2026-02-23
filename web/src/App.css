@@ -261,6 +261,43 @@ body.is-resizing-split * {
   transform: translate(-50%, -50%);
 }
 
+.file-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-surface);
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+.file-tab {
+  flex-shrink: 0;
+  padding: 0.45rem 0.9rem;
+  font-size: 0.78rem;
+  font-family: inherit;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-tab:hover {
+  color: var(--text-main);
+}
+
+.file-tab.active {
+  color: var(--accent-strong);
+  border-bottom-color: var(--accent-strong);
+}
+
 .slides-toolbar {
   padding: 0.68rem;
   border-bottom: 1px solid var(--line);

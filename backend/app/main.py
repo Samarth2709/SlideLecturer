@@ -15,12 +15,15 @@ from .config import settings
 from .models import (
     ChatStreamRequest,
     ClearChatResponse,
+    DeckHistoryEntry,
+    DeckHistoryResponse,
     DeckInfoResponse,
     DeckSectionsResponse,
     DeckSlidesResponse,
     DeckTranscriptsResponse,
     DeckUploadResponse,
     DeleteDeckResponse,
+    RemoveHistoryResponse,
     SaveConversationRequest,
     SaveConversationResponse,
     SectionSummary,
@@ -207,6 +210,50 @@ def ingest_url(body: URLIngestRequest) -> DeckUploadResponse:
         source_url=record.source_url,
         conversation=conversation,
     )
+
+
+@app.get("/api/v1/decks/history", response_model=DeckHistoryResponse)
+def get_deck_history() -> DeckHistoryResponse:
+    entries = deck_service.get_history()
+    return DeckHistoryResponse(
+        decks=[DeckHistoryEntry(**e) for e in entries],
+    )
+
+
+@app.post("/api/v1/decks/{deck_id}/reload", response_model=DeckUploadResponse)
+def reload_deck(
+    deck_id: str,
+    narrate_enabled: bool = Query(default=True),
+) -> DeckUploadResponse:
+    try:
+        record = deck_service.reload_deck(deck_id, narrate_enabled=narrate_enabled)
+    except DeckNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Deck not found in storage") from exc
+    except DeckValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if record.narrate_enabled:
+        ai_service.start_transcript_generation(record.deck_id, target_words=175)
+
+    conversation = deck_service.load_conversation(record.content_hash)
+
+    return DeckUploadResponse(
+        deck_id=record.deck_id,
+        filename=record.filename,
+        slide_count=record.slide_count,
+        created_at=record.created_at,
+        narrate_enabled=record.narrate_enabled,
+        content_hash=record.content_hash,
+        content_type=record.content_type,
+        source_url=record.source_url,
+        conversation=conversation,
+    )
+
+
+@app.delete("/api/v1/decks/{deck_id}/history", response_model=RemoveHistoryResponse)
+def remove_from_history(deck_id: str) -> RemoveHistoryResponse:
+    deck_service.remove_from_history(deck_id)
+    return RemoveHistoryResponse(status="removed")
 
 
 @app.get("/api/v1/decks/{deck_id}", response_model=DeckInfoResponse)

@@ -77,6 +77,7 @@ class DeckService:
         self.transcript_cache_dir.mkdir(parents=True, exist_ok=True)
         self.conversations_dir = self.storage_dir / "conversations"
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
+        self._manifest_path = self.storage_dir / "deck_manifest.json"
         self._decks: dict[str, DeckRecord] = {}
         self._lock = threading.RLock()
 
@@ -131,6 +132,7 @@ class DeckService:
             with self._lock:
                 self._decks[deck_id] = record
 
+            self._add_to_manifest(record)
             return record
         except DeckValidationError:
             shutil.rmtree(deck_dir, ignore_errors=True)
@@ -392,6 +394,7 @@ class DeckService:
             with self._lock:
                 self._decks[deck_id] = record
 
+            self._add_to_manifest(record)
             return record
         except (DeckValidationError, URLFetchError, URLValidationError):
             shutil.rmtree(deck_dir, ignore_errors=True)
@@ -476,6 +479,195 @@ class DeckService:
         except OSError:
             pass
 
+    def _load_manifest(self) -> list[dict]:
+        try:
+            data = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return data
+
+    def _save_manifest(self, entries: list[dict]) -> None:
+        temp = self._manifest_path.with_name(f".{self._manifest_path.name}.{uuid4().hex}.tmp")
+        try:
+            temp.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+            temp.replace(self._manifest_path)
+        except OSError:
+            try:
+                if temp.exists():
+                    temp.unlink()
+            except OSError:
+                pass
+
+    def _add_to_manifest(self, record: DeckRecord) -> None:
+        entries = self._load_manifest()
+        entries = [e for e in entries if e.get("deck_id") != record.deck_id]
+        entries.insert(0, {
+            "deck_id": record.deck_id,
+            "filename": record.filename,
+            "content_hash": record.content_hash,
+            "content_type": record.content_type,
+            "source_url": record.source_url,
+            "slide_count": record.slide_count,
+            "created_at": record.created_at.isoformat(),
+            "last_accessed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        self._save_manifest(entries)
+
+    def _remove_from_manifest(self, deck_id: str) -> None:
+        entries = self._load_manifest()
+        entries = [e for e in entries if e.get("deck_id") != deck_id]
+        self._save_manifest(entries)
+
+    def _touch_manifest_entry(self, deck_id: str) -> None:
+        entries = self._load_manifest()
+        for entry in entries:
+            if entry.get("deck_id") == deck_id:
+                entry["last_accessed_at"] = datetime.now(timezone.utc).isoformat()
+                break
+        self._save_manifest(entries)
+
+    def get_history(self) -> list[dict]:
+        entries = self._load_manifest()
+        valid = []
+        for entry in entries:
+            deck_dir = self.storage_dir / entry.get("deck_id", "")
+            if deck_dir.exists():
+                valid.append(entry)
+        return valid
+
+    def reload_deck(self, deck_id: str, narrate_enabled: bool = True) -> DeckRecord:
+        with self._lock:
+            existing = self._decks.get(deck_id)
+            if existing is not None:
+                self._touch_manifest_entry(deck_id)
+                return existing
+
+        deck_dir = self.storage_dir / deck_id
+        if not deck_dir.exists():
+            raise DeckNotFoundError(deck_id)
+
+        source_files = list(deck_dir.glob("source.*"))
+        if not source_files:
+            raise DeckNotFoundError(deck_id)
+
+        source_path = source_files[0]
+        suffix = source_path.suffix.lower()
+
+        if suffix == ".html":
+            return self._reload_url_deck(deck_id, deck_dir, source_path, narrate_enabled)
+
+        if suffix == ".pdf":
+            pdf_path = deck_dir / "deck.pdf"
+            if not pdf_path.exists():
+                shutil.copy2(source_path, pdf_path)
+        elif suffix in {".ppt", ".pptx"}:
+            pdf_path = deck_dir / "deck.pdf"
+            if not pdf_path.exists():
+                pdf_path = self._convert_powerpoint_to_pdf(source_path, deck_dir)
+        else:
+            raise DeckValidationError(f"Unknown source format: {suffix}")
+
+        content_hash = self._compute_content_hash(source_path)
+        slide_text = self._extract_slide_text(pdf_path)
+        transcript_cache_key = self._build_transcript_cache_key(slide_text) if narrate_enabled else None
+        cached_transcripts = None
+        has_cached_transcripts = False
+        if narrate_enabled and transcript_cache_key:
+            cached_transcripts = self._load_cached_transcripts(transcript_cache_key, expected_slide_count=len(slide_text))
+            has_cached_transcripts = cached_transcripts is not None and len(cached_transcripts) == len(slide_text)
+
+        manifest_entries = self._load_manifest()
+        filename = source_path.stem
+        for entry in manifest_entries:
+            if entry.get("deck_id") == deck_id and entry.get("filename"):
+                filename = entry["filename"]
+                break
+
+        record = DeckRecord(
+            deck_id=deck_id,
+            filename=filename,
+            source_path=source_path,
+            pdf_path=pdf_path,
+            slide_count=len(slide_text),
+            narrate_enabled=narrate_enabled,
+            slide_text=slide_text,
+            content_hash=content_hash,
+            transcript_cache_key=transcript_cache_key,
+            transcript_status="disabled" if not narrate_enabled else ("completed" if has_cached_transcripts else "queued"),
+            transcripts=cached_transcripts if cached_transcripts is not None else [None] * len(slide_text),
+            transcript_slide_errors=[None] * len(slide_text),
+        )
+
+        with self._lock:
+            self._decks[deck_id] = record
+
+        self._touch_manifest_entry(deck_id)
+        return record
+
+    def _reload_url_deck(self, deck_id: str, deck_dir: Path, source_path: Path, narrate_enabled: bool) -> DeckRecord:
+        from .url_service import compute_html_content_hash, extract_page_title, parse_sections
+
+        html = source_path.read_text(encoding="utf-8")
+        content_hash = compute_html_content_hash(html)
+
+        manifest_entries = self._load_manifest()
+        source_url = None
+        filename = extract_page_title(html)
+        for entry in manifest_entries:
+            if entry.get("deck_id") == deck_id:
+                source_url = entry.get("source_url")
+                if entry.get("filename"):
+                    filename = entry["filename"]
+                break
+
+        sections = parse_sections(html, source_url or "")
+        slide_text = [s.text_content for s in sections]
+        section_html = [s.html_content for s in sections]
+        section_headings = [s.heading_text for s in sections]
+        full_text = "\n\n".join(f"## {s.heading_text}\n{s.text_content}" for s in sections)
+
+        transcript_cache_key = self._build_transcript_cache_key(slide_text) if narrate_enabled else None
+        cached_transcripts = None
+        has_cached_transcripts = False
+        if narrate_enabled and transcript_cache_key:
+            cached_transcripts = self._load_cached_transcripts(transcript_cache_key, expected_slide_count=len(slide_text))
+            has_cached_transcripts = cached_transcripts is not None and len(cached_transcripts) == len(slide_text)
+
+        record = DeckRecord(
+            deck_id=deck_id,
+            filename=filename,
+            source_path=source_path,
+            pdf_path=None,
+            slide_count=len(sections),
+            narrate_enabled=narrate_enabled,
+            slide_text=slide_text,
+            content_type="url",
+            source_url=source_url,
+            section_html=section_html,
+            section_headings=section_headings,
+            full_text=full_text,
+            content_hash=content_hash,
+            transcript_cache_key=transcript_cache_key,
+            transcript_status="disabled" if not narrate_enabled else ("completed" if has_cached_transcripts else "queued"),
+            transcripts=cached_transcripts if cached_transcripts is not None else [None] * len(sections),
+            transcript_slide_errors=[None] * len(sections),
+        )
+
+        with self._lock:
+            self._decks[deck_id] = record
+
+        self._touch_manifest_entry(deck_id)
+        return record
+
+    def remove_from_history(self, deck_id: str) -> None:
+        self._remove_from_manifest(deck_id)
+        with self._lock:
+            self._decks.pop(deck_id, None)
+        deck_dir = self.storage_dir / deck_id
+        shutil.rmtree(deck_dir, ignore_errors=True)
+
     def delete_deck(self, deck_id: str) -> None:
         with self._lock:
             deck = self._decks.pop(deck_id, None)
@@ -483,6 +675,7 @@ class DeckService:
         if deck is None:
             raise DeckNotFoundError(deck_id)
 
+        self._remove_from_manifest(deck_id)
         shutil.rmtree(deck.source_path.parent, ignore_errors=True)
 
     def _extract_slide_text(self, pdf_path: Path) -> list[str]:

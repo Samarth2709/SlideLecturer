@@ -119,5 +119,24 @@ class DeckSectionsResponse(BaseModel):
     sections: list[SectionSummary]
 
 
+class DeckHistoryEntry(BaseModel):
+    deck_id: str
+    filename: str
+    content_hash: str
+    content_type: str = "pdf"
+    source_url: str | None = None
+    slide_count: int
+    created_at: str
+    last_accessed_at: str
+
+
+class DeckHistoryResponse(BaseModel):
+    decks: list[DeckHistoryEntry]
+
+
+class RemoveHistoryResponse(BaseModel):
+    status: Literal["removed"]
+
+
 class ErrorResponse(BaseModel):
     detail: str

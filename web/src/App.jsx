@@ -1030,6 +1030,9 @@ function App() {
   const [urlInput, setUrlInput] = useState('');
   const [urlLoading, setUrlLoading] = useState(false);
   const [inputMode, setInputMode] = useState('file'); // 'file' or 'url'
+  const [historyEntries, setHistoryEntries] = useState([]);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   const workspaceRef = useRef(null);
   const slideScrollRef = useRef(null);
@@ -1053,6 +1056,7 @@ function App() {
   const speechRequestIdRef = useRef(0);
   const contextEntriesRef = useRef(contextEntries);
   const contextFileInputRef = useRef(null);
+  const historyDropdownRef = useRef(null);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
   const messages = activeBranch?.messages || [WELCOME_MESSAGE];
@@ -1769,6 +1773,28 @@ function App() {
     return () => window.removeEventListener('keydown', handleEscape);
   }, [isBranchMapOpen]);
 
+  useEffect(() => {
+    if (!isHistoryOpen) return;
+
+    const handleClickOutside = (event) => {
+      if (historyDropdownRef.current && !historyDropdownRef.current.contains(event.target)) {
+        setIsHistoryOpen(false);
+      }
+    };
+    const handleEscape = (event) => {
+      if (event.key === 'Escape') {
+        setIsHistoryOpen(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    window.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      window.removeEventListener('keydown', handleEscape);
+    };
+  }, [isHistoryOpen]);
+
   const hasDeck = Boolean(deck?.deck_id);
   const isUrlDeck = deck?.content_type === 'url';
   const isDeckNarrationEnabled = deck?.narrate_enabled !== false;
@@ -2149,10 +2175,6 @@ function App() {
     resetTranscriptState(0);
 
     try {
-      if (deck?.deck_id) {
-        await safeDeleteDeck(deck.deck_id);
-      }
-
       const form = new FormData();
       form.append('file', file);
       form.append('narrate_enabled', String(narrateEnabled));
@@ -2217,10 +2239,6 @@ function App() {
     resetTranscriptState(0);
 
     try {
-      if (deck?.deck_id) {
-        await safeDeleteDeck(deck.deck_id);
-      }
-
       const response = await fetch(apiUrl('/api/v1/decks/ingest-url'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2276,6 +2294,108 @@ function App() {
       resetTranscriptState(0);
     } finally {
       setUrlLoading(false);
+    }
+  }
+
+  async function fetchHistory() {
+    try {
+      const response = await fetch(apiUrl('/api/v1/decks/history'));
+      if (!response.ok) return;
+      const data = await response.json();
+      setHistoryEntries(data.decks || []);
+    } catch {
+      // Silently fail - history is non-critical
+    }
+  }
+
+  async function toggleHistory() {
+    if (isHistoryOpen) {
+      setIsHistoryOpen(false);
+      return;
+    }
+    setIsHistoryOpen(true);
+    await fetchHistory();
+  }
+
+  async function loadFromHistory(entry) {
+    setError('');
+    setHistoryLoading(true);
+    setIsHistoryOpen(false);
+    resetTranscriptState(0);
+
+    try {
+      const response = await fetch(
+        apiUrl(`/api/v1/decks/${entry.deck_id}/reload?narrate_enabled=${narrateEnabled}`),
+        { method: 'POST' }
+      );
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(extractApiErrorMessage(data, 'Failed to reload deck'));
+      }
+
+      const payload = await response.json();
+      setDeck(payload);
+      if (typeof payload?.narrate_enabled === 'boolean') {
+        setNarrateEnabled(payload.narrate_enabled);
+      }
+      if (payload.conversation) {
+        restoreBranches(payload.conversation);
+        const rawEntries = Array.isArray(payload.conversation.context_entries)
+          ? payload.conversation.context_entries
+          : [];
+        const restoredContext = rawEntries
+          .map((e, i) => {
+            if (typeof e === 'string') {
+              return { name: `Entry ${i + 1}`, content: e, type: 'text' };
+            }
+            if (e && typeof e === 'object' && e.content) {
+              return {
+                name: String(e.name || `Entry ${i + 1}`),
+                content: String(e.content),
+                type: e.type === 'file' ? 'file' : 'text',
+              };
+            }
+            return null;
+          })
+          .filter(Boolean);
+        setContextEntries(restoredContext);
+      } else {
+        resetBranches();
+        setContextEntries([]);
+      }
+      resetTranscriptState(payload.slide_count || 0);
+      setInputValue('');
+
+      if (payload.content_type === 'url') {
+        await fetchSections(payload.deck_id);
+      } else {
+        await fetchSlides(payload.deck_id);
+      }
+    } catch (loadError) {
+      setError(normalizeError(loadError, 'Failed to load deck from history'));
+      setDeck(null);
+      setSlides([]);
+      resetBranches();
+      resetTranscriptState(0);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function removeFromHistory(e, deckId) {
+    e.stopPropagation();
+    try {
+      await fetch(apiUrl(`/api/v1/decks/${deckId}/history`), { method: 'DELETE' });
+      setHistoryEntries((prev) => prev.filter((entry) => entry.deck_id !== deckId));
+      if (deck?.deck_id === deckId) {
+        setDeck(null);
+        setSlides([]);
+        resetBranches();
+        resetTranscriptState(0);
+      }
+    } catch {
+      // Silently fail
     }
   }
 
@@ -3652,6 +3772,59 @@ function App() {
             {deck.filename}
           </p>
         ) : null}
+        <div className="topbar-actions">
+          <div className="history-wrapper" ref={historyDropdownRef}>
+            <button
+              type="button"
+              className={`ghost-btn history-btn ${isHistoryOpen ? 'active' : ''}`}
+              onClick={toggleHistory}
+              disabled={uploading || sending || historyLoading}
+              title="Recent lectures"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M8 3.5V8L10.5 10.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M2 8C2 4.686 4.686 2 8 2C11.314 2 14 4.686 14 8C14 11.314 11.314 14 8 14C5.5 14 3.37 12.44 2.5 10.25" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M2 12.5V10.25H4.25" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              History
+            </button>
+            {isHistoryOpen && (
+              <div className="history-dropdown">
+                {historyEntries.length === 0 ? (
+                  <p className="history-empty">No recent lectures</p>
+                ) : (
+                  <ul className="history-list">
+                    {historyEntries.map((entry) => (
+                      <li
+                        key={entry.deck_id}
+                        className={`history-item ${deck?.deck_id === entry.deck_id ? 'active' : ''}`}
+                        onClick={() => loadFromHistory(entry)}
+                      >
+                        <div className="history-item-info">
+                          <span className="history-item-name" title={entry.source_url || entry.filename}>
+                            {entry.filename}
+                          </span>
+                          <span className="history-item-meta">
+                            {entry.slide_count} {entry.content_type === 'url' ? 'sections' : 'slides'}
+                            {entry.last_accessed_at ? ` \u00b7 ${new Date(entry.last_accessed_at).toLocaleDateString()}` : ''}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="history-item-remove"
+                          onClick={(e) => removeFromHistory(e, entry.deck_id)}
+                          title="Remove from history"
+                        >
+                          \u00d7
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
         <input
           ref={fileInputRef}
           className="hidden-file-input"
@@ -4401,7 +4574,7 @@ function App() {
               type="button"
               className="next-chunk-btn"
               onClick={sendNextChunk}
-              disabled={!hasDeck || sending || clearingChat}
+              disabled={!hasDeck || clearingChat}
               title="Send 'Next chunk'"
             >
               Next Chunk

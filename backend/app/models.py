@@ -16,6 +16,7 @@ class DeckUploadResponse(BaseModel):
     narrate_enabled: bool
     content_hash: str
     conversation: dict | None = None
+    source_files: list[dict] = []
 
 
 class SlideSummary(BaseModel):

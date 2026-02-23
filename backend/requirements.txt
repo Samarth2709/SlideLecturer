@@ -4,3 +4,4 @@ python-multipart>=0.0.9
 PyMuPDF>=1.23
 anthropic>=0.18.0
 python-dotenv>=1.0.0
+rlms>=0.1.0

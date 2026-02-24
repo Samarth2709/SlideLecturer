@@ -41,6 +41,9 @@ const DECK_PREFERENCES_STORAGE_PREFIX = 'slidelecturer.deckPreferences.v1';
 const SEARCH_SNIPPET_MAX_CHARS = 180;
 const MAX_CHAT_HISTORY_MESSAGES = 40;
 const MAX_CONTEXT_TOTAL_LENGTH = 50000;
+const CHAT_QUESTION_MAX_CHARS = 6000;
+const MAX_REPLY_QUOTE_CHARS = 1200;
+const REPLY_PREVIEW_MAX_CHARS = 260;
 const MAX_FILE_SIZE_BYTES = 500_000;
 const ALLOWED_FILE_EXTENSIONS = [
   '.txt', '.md', '.csv', '.py', '.c', '.cpp', '.h', '.js', '.ts',
@@ -772,6 +775,51 @@ function TextIcon({ className = 'icon' }) {
   );
 }
 
+function resolveSelectionAnchor(range, scrollerElement) {
+  if (!range || !(scrollerElement instanceof HTMLElement)) {
+    return null;
+  }
+
+  const clientRects = Array.from(range.getClientRects()).filter(
+    (rect) => rect.width > 0 || rect.height > 0
+  );
+
+  let selectionRect = null;
+  if (clientRects.length) {
+    const minimumTop = clientRects.reduce(
+      (value, rect) => Math.min(value, rect.top),
+      Number.POSITIVE_INFINITY
+    );
+    const topRects = clientRects.filter((rect) => Math.abs(rect.top - minimumTop) <= 2);
+    selectionRect = topRects.reduce(
+      (best, rect) => (best === null || rect.right > best.right ? rect : best),
+      null
+    );
+  }
+
+  if (!selectionRect) {
+    const fallbackRect = range.getBoundingClientRect();
+    if (fallbackRect.width || fallbackRect.height) {
+      selectionRect = fallbackRect;
+    }
+  }
+
+  if (!selectionRect) {
+    return null;
+  }
+
+  const scrollerRect = scrollerElement.getBoundingClientRect();
+  const estimatedButtonWidth = 96;
+  const anchorContentXRaw = selectionRect.right - scrollerRect.left + scrollerElement.scrollLeft + 8;
+  const anchorContentYRaw = selectionRect.top - scrollerRect.top + scrollerElement.scrollTop;
+  const contentWidth = Math.max(scrollerElement.scrollWidth, scrollerElement.clientWidth);
+
+  return {
+    anchorContentX: Math.min(Math.max(anchorContentXRaw, 8), Math.max(8, contentWidth - estimatedButtonWidth)),
+    anchorContentY: Math.max(8, anchorContentYRaw),
+  };
+}
+
 function MessageBubble({
   message,
   isEditing,
@@ -784,9 +832,11 @@ function MessageBubble({
   onEditCancel,
   onEditSave,
   onEditDraftChange,
+  onReplySelectionCandidate,
 }) {
   const normalizedAssistantMarkdown = preprocessAssistantMarkdown(message.content);
   const canSaveEdit = editDraft.trim().length > 0 && editDraft !== message.content;
+  const messageContentRef = useRef(null);
 
   const markdownComponents = {
     code({ className, children, ...props }) {
@@ -839,6 +889,66 @@ function MessageBubble({
   };
 
   const roleLabel = message.role === 'user' ? 'You' : 'AI';
+
+  const emitReplySelectionCandidate = useCallback(() => {
+    if (isEditing || typeof window === 'undefined') {
+      onReplySelectionCandidate?.(null);
+      return;
+    }
+
+    const messageContentElement = messageContentRef.current;
+    if (!messageContentElement) {
+      onReplySelectionCandidate?.(null);
+      return;
+    }
+
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount < 1) {
+      onReplySelectionCandidate?.(null);
+      return;
+    }
+
+    const selectedText = String(selection.toString() || '');
+    if (!selectedText.trim()) {
+      onReplySelectionCandidate?.(null);
+      return;
+    }
+
+    const range = selection.getRangeAt(0);
+    if (
+      !messageContentElement.contains(range.startContainer)
+      || !messageContentElement.contains(range.endContainer)
+    ) {
+      onReplySelectionCandidate?.(null);
+      return;
+    }
+
+    const scrollerElement = messageContentElement.closest('.messages-list');
+    if (!(scrollerElement instanceof HTMLElement)) {
+      onReplySelectionCandidate?.(null);
+      return;
+    }
+
+    const anchor = resolveSelectionAnchor(range, scrollerElement);
+    if (!anchor) {
+      onReplySelectionCandidate?.(null);
+      return;
+    }
+
+    onReplySelectionCandidate?.({
+      messageId: message.id,
+      messageRole: message.role,
+      selectedText,
+      anchorContentX: anchor.anchorContentX,
+      anchorContentY: anchor.anchorContentY,
+    });
+  }, [isEditing, message.id, message.role, onReplySelectionCandidate]);
+
+  useEffect(() => {
+    if (isEditing) {
+      onReplySelectionCandidate?.(null);
+    }
+  }, [isEditing, onReplySelectionCandidate]);
 
   return (
     <article className={`message-bubble ${message.role}`}>
@@ -898,7 +1008,14 @@ function MessageBubble({
           ) : null}
         </div>
       </header>
-      <div className={`message-content ${message.role}`}>
+      <div
+        ref={messageContentRef}
+        className={`message-content ${message.role}`}
+        data-message-id={message.id}
+        data-message-role={message.role}
+        onMouseUp={emitReplySelectionCandidate}
+        onKeyUp={emitReplySelectionCandidate}
+      >
         {isEditing ? (
           <textarea
             className="message-editor"
@@ -974,6 +1091,65 @@ async function copyTextToClipboard(text) {
   }
 }
 
+function normalizeReplyText(rawText) {
+  return String(rawText || '').replace(/\s+/g, ' ').trim();
+}
+
+function truncateWithEllipsis(input, maxChars) {
+  const text = String(input || '');
+  const limit = Number.isInteger(maxChars) ? maxChars : 0;
+  if (!text || limit <= 0 || text.length <= limit) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, limit - 3)).trimEnd()}...`;
+}
+
+function composeQuestionWithReplyContext(question, replyContext) {
+  const trimmedQuestion = String(question || '').trim();
+  if (!trimmedQuestion) {
+    return {
+      composedQuestion: '',
+      usedReplyContext: false,
+    };
+  }
+
+  const rawQuote = String(replyContext?.selectedText || '');
+  if (!rawQuote.trim()) {
+    return {
+      composedQuestion: trimmedQuestion,
+      usedReplyContext: false,
+    };
+  }
+
+  const prefix = 'Replying to: "';
+  const suffix = '"\n\n';
+  const maxQuoteByLength = CHAT_QUESTION_MAX_CHARS - prefix.length - suffix.length - trimmedQuestion.length;
+
+  if (maxQuoteByLength <= 0) {
+    return {
+      composedQuestion: trimmedQuestion,
+      usedReplyContext: false,
+    };
+  }
+
+  const quoteLimit = Math.min(MAX_REPLY_QUOTE_CHARS, maxQuoteByLength);
+  const boundedQuote = rawQuote.length > quoteLimit
+    ? rawQuote.slice(0, quoteLimit)
+    : rawQuote;
+
+  if (!boundedQuote.trim()) {
+    return {
+      composedQuestion: trimmedQuestion,
+      usedReplyContext: false,
+    };
+  }
+
+  return {
+    composedQuestion: `${prefix}${boundedQuote}${suffix}${trimmedQuestion}`,
+    usedReplyContext: true,
+  };
+}
+
 function App() {
   const [deck, setDeck] = useState(null);
   const [slides, setSlides] = useState([]);
@@ -1037,6 +1213,8 @@ function App() {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [activeFileTabIndex, setActiveFileTabIndex] = useState(null);
+  const [selectionReplyCandidate, setSelectionReplyCandidate] = useState(null);
+  const [activeReplyContext, setActiveReplyContext] = useState(null);
 
   const workspaceRef = useRef(null);
   const slideScrollRef = useRef(null);
@@ -1061,6 +1239,8 @@ function App() {
   const contextEntriesRef = useRef(contextEntries);
   const contextFileInputRef = useRef(null);
   const historyDropdownRef = useRef(null);
+  const messagesListRef = useRef(null);
+  const replyButtonRef = useRef(null);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
   const messages = activeBranch?.messages || [WELCOME_MESSAGE];
@@ -1102,6 +1282,50 @@ function App() {
       URL.revokeObjectURL(activeObjectUrl);
     }
   }, []);
+  const handleReplySelectionCandidate = useCallback((candidate) => {
+    if (!candidate || !candidate.messageId) {
+      setSelectionReplyCandidate(null);
+      return;
+    }
+
+    const selectedText = String(candidate.selectedText || '');
+    if (!selectedText.trim()) {
+      setSelectionReplyCandidate(null);
+      return;
+    }
+
+    setSelectionReplyCandidate({
+      messageId: candidate.messageId,
+      messageRole: candidate.messageRole === 'assistant' ? 'assistant' : 'user',
+      selectedText,
+      anchorContentX: Number(candidate.anchorContentX) || 0,
+      anchorContentY: Number(candidate.anchorContentY) || 0,
+    });
+  }, []);
+
+  const clearReplyContext = useCallback(() => {
+    setActiveReplyContext(null);
+  }, []);
+
+  const activateReplyFromSelection = useCallback(() => {
+    if (!selectionReplyCandidate) {
+      return;
+    }
+
+    setActiveReplyContext({
+      messageId: selectionReplyCandidate.messageId,
+      messageRole: selectionReplyCandidate.messageRole,
+      selectedText: selectionReplyCandidate.selectedText,
+    });
+    setSelectionReplyCandidate(null);
+
+    if (typeof window !== 'undefined') {
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+    }
+
+    inputRef.current?.focus();
+  }, [selectionReplyCandidate]);
 
   const branchTree = useMemo(() => {
     const nonWelcomeMessagesFor = (branch) =>
@@ -1308,6 +1532,8 @@ function App() {
     setIsBranchMapOpen(false);
     setExpandedBranchIds(new Set());
     setShowAllTurns(false);
+    setSelectionReplyCandidate(null);
+    setActiveReplyContext(null);
     branchCounterRef.current = 1;
   }, []);
 
@@ -1361,6 +1587,8 @@ function App() {
     setIsBranchMapOpen(false);
     setExpandedBranchIds(new Set());
     setShowAllTurns(false);
+    setSelectionReplyCandidate(null);
+    setActiveReplyContext(null);
 
     branchCounterRef.current = typeof branch_counter === 'number' ? branch_counter : 1;
   }, []);
@@ -1759,6 +1987,8 @@ function App() {
 
   useEffect(() => {
     setQueueDraftSnapshot('');
+    setSelectionReplyCandidate(null);
+    setActiveReplyContext(null);
   }, [activeBranchId]);
 
   useEffect(() => {
@@ -1798,6 +2028,71 @@ function App() {
       window.removeEventListener('keydown', handleEscape);
     };
   }, [isHistoryOpen]);
+
+  useEffect(() => {
+    if (!selectionReplyCandidate) {
+      return;
+    }
+
+    const handleDocumentMouseDown = (event) => {
+      if (replyButtonRef.current?.contains(event.target)) {
+        return;
+      }
+      setSelectionReplyCandidate(null);
+    };
+
+    const handleEscape = (event) => {
+      if (event.key === 'Escape') {
+        setSelectionReplyCandidate(null);
+      }
+    };
+
+    document.addEventListener('mousedown', handleDocumentMouseDown);
+    window.addEventListener('keydown', handleEscape);
+
+    return () => {
+      document.removeEventListener('mousedown', handleDocumentMouseDown);
+      window.removeEventListener('keydown', handleEscape);
+    };
+  }, [selectionReplyCandidate]);
+
+  useEffect(() => {
+    if (!selectionReplyCandidate) {
+      return;
+    }
+
+    const messageExists = messages.some((message) => message.id === selectionReplyCandidate.messageId);
+    if (!messageExists) {
+      setSelectionReplyCandidate(null);
+    }
+  }, [messages, selectionReplyCandidate]);
+
+  useEffect(() => {
+    if (!activeReplyContext) {
+      return;
+    }
+
+    const messageExists = messages.some((message) => message.id === activeReplyContext.messageId);
+    if (!messageExists) {
+      setActiveReplyContext(null);
+    }
+  }, [messages, activeReplyContext]);
+
+  const replyPreviewText = useMemo(
+    () => truncateWithEllipsis(normalizeReplyText(activeReplyContext?.selectedText || ''), REPLY_PREVIEW_MAX_CHARS),
+    [activeReplyContext]
+  );
+
+  const replySelectionButtonStyle = useMemo(() => {
+    if (!selectionReplyCandidate) {
+      return null;
+    }
+
+    return {
+      left: `${selectionReplyCandidate.anchorContentX}px`,
+      top: `${selectionReplyCandidate.anchorContentY}px`,
+    };
+  }, [selectionReplyCandidate]);
 
   const hasDeck = Boolean(deck?.deck_id);
   const isUrlDeck = deck?.content_type === 'url';
@@ -2405,7 +2700,8 @@ function App() {
   async function removeFromHistory(e, deckId) {
     e.stopPropagation();
     try {
-      await fetch(apiUrl(`/api/v1/decks/${deckId}/history`), { method: 'DELETE' });
+      const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/history`), { method: 'DELETE' });
+      if (!response.ok) return;
       setHistoryEntries((prev) => prev.filter((entry) => entry.deck_id !== deckId));
       if (deck?.deck_id === deckId) {
         setDeck(null);
@@ -3290,7 +3586,14 @@ function App() {
     requestContext = null,
   }) {
     const normalizedQuestion = String(question || '').trim();
-    if (!deck?.deck_id || !branchId || sendingRef.current || !normalizedQuestion) {
+    if (
+      !deck?.deck_id
+      || !branchId
+      || sendingRef.current
+      || clearingChatRef.current
+      || historyLoading
+      || !normalizedQuestion
+    ) {
       return false;
     }
 
@@ -3447,7 +3750,7 @@ function App() {
   }
 
   async function submitComposerMessage() {
-    if (!deck?.deck_id || clearingChatRef.current) {
+    if (!deck?.deck_id || clearingChatRef.current || historyLoading) {
       return;
     }
 
@@ -3455,13 +3758,23 @@ function App() {
     if (!question) {
       return;
     }
+    const { composedQuestion, usedReplyContext } = composeQuestionWithReplyContext(
+      question,
+      activeReplyContext
+    );
+    if (!composedQuestion) {
+      return;
+    }
 
     if (sendingRef.current) {
       if (!editingQueuedMessageId) {
-        enqueueMessageForBranch(activeBranchId, question, {
+        enqueueMessageForBranch(activeBranchId, composedQuestion, {
           currentSlideIndex,
           focusedSlideIndex,
         });
+        if (usedReplyContext) {
+          setActiveReplyContext(null);
+        }
       }
       setInputValue('');
       editingQueuedMessageIdRef.current = null;
@@ -3482,9 +3795,12 @@ function App() {
     }
 
     setInputValue('');
+    if (usedReplyContext) {
+      setActiveReplyContext(null);
+    }
     await streamMessageToBranch({
       branchId: activeBranchId,
-      question,
+      question: composedQuestion,
       queuedMessageId: null,
     });
   }
@@ -3495,20 +3811,32 @@ function App() {
   }
 
   async function sendNextChunk() {
-    if (!deck?.deck_id || clearingChatRef.current) {
+    if (!deck?.deck_id || clearingChatRef.current || historyLoading) {
       return;
     }
-    const question = 'Next chunk';
+    const { composedQuestion, usedReplyContext } = composeQuestionWithReplyContext(
+      'Next chunk',
+      activeReplyContext
+    );
+    if (!composedQuestion) {
+      return;
+    }
     if (sendingRef.current) {
-      enqueueMessageForBranch(activeBranchId, question, {
+      enqueueMessageForBranch(activeBranchId, composedQuestion, {
         currentSlideIndex,
         focusedSlideIndex,
       });
+      if (usedReplyContext) {
+        setActiveReplyContext(null);
+      }
       return;
+    }
+    if (usedReplyContext) {
+      setActiveReplyContext(null);
     }
     await streamMessageToBranch({
       branchId: activeBranchId,
-      question,
+      question: composedQuestion,
       queuedMessageId: null,
     });
   }
@@ -4516,7 +4844,10 @@ function App() {
             </div>
           </header>
 
-          <div className="messages-list">
+          <div
+            ref={messagesListRef}
+            className="messages-list"
+          >
             {messages.map((message) => (
               <MessageBubble
                 key={message.id}
@@ -4531,9 +4862,22 @@ function App() {
                 onEditCancel={cancelEditingMessage}
                 onEditSave={saveEditingMessage}
                 onEditDraftChange={setMessageDraft}
+                onReplySelectionCandidate={handleReplySelectionCandidate}
               />
             ))}
             {sending ? <p className="typing-indicator">AI is typing...</p> : null}
+            {selectionReplyCandidate ? (
+              <button
+                ref={replyButtonRef}
+                type="button"
+                className="reply-selection-btn"
+                style={replySelectionButtonStyle || undefined}
+                onClick={activateReplyFromSelection}
+                aria-label="Reply to selected text"
+              >
+                Reply
+              </button>
+            ) : null}
           </div>
 
           {queuedMessages.length ? (
@@ -4610,11 +4954,35 @@ function App() {
           ) : null}
 
           <form className="chat-input" onSubmit={sendMessage}>
+            {activeReplyContext ? (
+              <div className="reply-context-preview">
+                <div className="reply-context-preview-copy">
+                  <p className="reply-context-preview-label">
+                    Replying to {activeReplyContext.messageRole === 'assistant' ? 'AI' : 'You'}
+                  </p>
+                  <p
+                    className="reply-context-preview-quote"
+                    title={normalizeReplyText(activeReplyContext.selectedText || '')}
+                  >
+                    "{replyPreviewText}"
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="reply-context-preview-remove"
+                  onClick={clearReplyContext}
+                  aria-label="Remove selected reply context"
+                  title="Remove reply context"
+                >
+                  ×
+                </button>
+              </div>
+            ) : null}
             <button
               type="button"
               className="next-chunk-btn"
               onClick={sendNextChunk}
-              disabled={!hasDeck || clearingChat}
+              disabled={!hasDeck || clearingChat || historyLoading}
               title="Send 'Next chunk'"
             >
               Next Chunk
@@ -4625,7 +4993,7 @@ function App() {
               onChange={handleComposerChange}
               onKeyDown={handleComposerKeyDown}
               placeholder={inputPlaceholder}
-              disabled={!hasDeck || clearingChat}
+              disabled={!hasDeck || clearingChat || historyLoading}
               rows={Math.min(5, Math.max(1, inputValue.split('\n').length))}
               aria-label="Message composer"
               aria-keyshortcuts="q"
@@ -4633,7 +5001,7 @@ function App() {
             <button
               type="submit"
               className="chat-send-btn"
-              disabled={!hasDeck || sending || clearingChat || !inputValue.trim()}
+              disabled={!hasDeck || sending || clearingChat || historyLoading || !inputValue.trim()}
               aria-label="Send message"
               title="Send"
             >

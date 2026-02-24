@@ -266,10 +266,15 @@ class DeckService:
         with self._lock:
             deck = self._decks.get(deck_id)
 
-        if deck is None:
-            raise DeckNotFoundError(deck_id)
+        if deck is not None:
+            return deck
 
-        return deck
+        # Multi-worker deployments keep in-memory decks per-process.
+        # If this worker has not seen the deck yet, reload it from storage.
+        try:
+            return self.reload_deck(deck_id, narrate_enabled=True)
+        except (DeckNotFoundError, DeckValidationError) as exc:
+            raise DeckNotFoundError(deck_id) from exc
 
     def list_slides(self, deck_id: str) -> list[dict]:
         deck = self.get_deck(deck_id)
@@ -622,35 +627,39 @@ class DeckService:
                 pass
 
     def _add_to_manifest(self, record: DeckRecord) -> None:
-        entries = self._load_manifest()
-        entries = [e for e in entries if e.get("deck_id") != record.deck_id]
-        entries.insert(0, {
-            "deck_id": record.deck_id,
-            "filename": record.filename,
-            "content_hash": record.content_hash,
-            "content_type": record.content_type,
-            "source_url": record.source_url,
-            "slide_count": record.slide_count,
-            "created_at": record.created_at.isoformat(),
-            "last_accessed_at": datetime.now(timezone.utc).isoformat(),
-        })
-        self._save_manifest(entries)
+        with self._lock:
+            entries = self._load_manifest()
+            entries = [e for e in entries if e.get("deck_id") != record.deck_id]
+            entries.insert(0, {
+                "deck_id": record.deck_id,
+                "filename": record.filename,
+                "content_hash": record.content_hash,
+                "content_type": record.content_type,
+                "source_url": record.source_url,
+                "slide_count": record.slide_count,
+                "created_at": record.created_at.isoformat(),
+                "last_accessed_at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._save_manifest(entries)
 
     def _remove_from_manifest(self, deck_id: str) -> None:
-        entries = self._load_manifest()
-        entries = [e for e in entries if e.get("deck_id") != deck_id]
-        self._save_manifest(entries)
+        with self._lock:
+            entries = self._load_manifest()
+            entries = [e for e in entries if e.get("deck_id") != deck_id]
+            self._save_manifest(entries)
 
     def _touch_manifest_entry(self, deck_id: str) -> None:
-        entries = self._load_manifest()
-        for entry in entries:
-            if entry.get("deck_id") == deck_id:
-                entry["last_accessed_at"] = datetime.now(timezone.utc).isoformat()
-                break
-        self._save_manifest(entries)
+        with self._lock:
+            entries = self._load_manifest()
+            for entry in entries:
+                if entry.get("deck_id") == deck_id:
+                    entry["last_accessed_at"] = datetime.now(timezone.utc).isoformat()
+                    break
+            self._save_manifest(entries)
 
     def get_history(self) -> list[dict]:
-        entries = self._load_manifest()
+        with self._lock:
+            entries = self._load_manifest()
         valid = []
         for entry in entries:
             deck_dir = self.storage_dir / entry.get("deck_id", "")
@@ -783,9 +792,18 @@ class DeckService:
         return record
 
     def remove_from_history(self, deck_id: str) -> None:
-        self._remove_from_manifest(deck_id)
         with self._lock:
+            entries = self._load_manifest()
+            content_hash = None
+            for entry in entries:
+                if entry.get("deck_id") == deck_id:
+                    content_hash = entry.get("content_hash")
+                    break
+            entries = [e for e in entries if e.get("deck_id") != deck_id]
+            self._save_manifest(entries)
             self._decks.pop(deck_id, None)
+        if content_hash:
+            self.delete_conversation(content_hash)
         deck_dir = self.storage_dir / deck_id
         shutil.rmtree(deck_dir, ignore_errors=True)
 

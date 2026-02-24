@@ -1164,6 +1164,7 @@ body.is-resizing-split * {
 .messages-list {
   flex: 1;
   overflow: auto;
+  position: relative;
   padding: 0.68rem;
   display: flex;
   flex-direction: column;
@@ -1375,6 +1376,16 @@ body.is-resizing-split * {
   margin: 0.46rem 0 0.7rem;
 }
 
+.message-content.assistant .ai-code-block *::selection {
+  background: rgba(132, 173, 230, 0.48) !important;
+  color: #f5f9ff !important;
+}
+
+.message-content.assistant .ai-code-block *::-moz-selection {
+  background: rgba(132, 173, 230, 0.48) !important;
+  color: #f5f9ff !important;
+}
+
 .message-content.assistant .ai-code-block code {
   background: transparent;
   border: 0;
@@ -1527,6 +1538,87 @@ body.is-resizing-split * {
   grid-template-columns: auto 1fr auto;
   gap: 0.46rem;
   align-items: end;
+}
+
+.reply-context-preview {
+  grid-column: 1 / -1;
+  border: 1px solid #4b5f75;
+  border-radius: 10px;
+  background: #162130;
+  padding: 0.42rem 0.56rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.62rem;
+}
+
+.reply-context-preview-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.14rem;
+}
+
+.reply-context-preview-label {
+  margin: 0;
+  color: #afbdd0;
+  font-size: 0.68rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.reply-context-preview-quote {
+  margin: 0;
+  color: #e7edf5;
+  font-size: 0.82rem;
+  line-height: 1.32;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reply-context-preview-remove {
+  flex: 0 0 auto;
+  border: 1px solid #62778f;
+  border-radius: 8px;
+  background: #25364b;
+  color: #e8eef6;
+  width: 1.55rem;
+  height: 1.55rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  line-height: 1;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.reply-context-preview-remove:hover {
+  background: #2d425a;
+  border-color: #738ba6;
+}
+
+.reply-selection-btn {
+  position: absolute;
+  transform: translateY(-6%);
+  z-index: 24;
+  border: 1px solid #6e849d;
+  border-radius: 999px;
+  background: #2c3f53;
+  color: #f1f6fb;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 0.26rem 0.58rem;
+  box-shadow: 0 7px 18px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+}
+
+.reply-selection-btn:hover {
+  background: #35516a;
+  border-color: #8aa2bc;
 }
 
 .chat-input textarea {

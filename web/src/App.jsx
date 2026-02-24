@@ -4160,7 +4160,7 @@ function App() {
                           onClick={(e) => removeFromHistory(e, entry.deck_id)}
                           title="Remove from history"
                         >
-                          \u00d7
+                          {"\u00d7"}
                         </button>
                       </li>
                     ))}

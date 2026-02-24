@@ -25,14 +25,25 @@ from .models import (
     DeckUploadResponse,
     DeleteDeckResponse,
     RemoveHistoryResponse,
+    FindSessionByContentRequest,
+    FindSessionByContentResponse,
+    URLContentHashRequest,
+    URLContentHashResponse,
     SaveConversationRequest,
     SaveConversationResponse,
     SectionSummary,
+    SessionAddDeckRequest,
+    SessionAddDeckResponse,
+    SessionChatStreamRequest,
+    SessionCreateResponse,
+    SessionHistoryEntry,
+    SessionHistoryResponse,
+    SessionReloadResponse,
     SlideSummary,
     URLIngestRequest,
 )
 from .services.ai_service import AIService
-from .services.deck_service import DeckNotFoundError, DeckService, DeckValidationError
+from .services.deck_service import DeckNotFoundError, DeckService, DeckValidationError, SessionNotFoundError
 from .services.url_service import URLFetchError, URLValidationError
 from .services.tts_service import ElevenLabsTTSService, TTSConfigurationError, TTSProviderError
 
@@ -220,6 +231,20 @@ def ingest_url(body: URLIngestRequest) -> DeckUploadResponse:
         source_url=record.source_url,
         conversation=conversation,
     )
+
+
+@app.post("/api/v1/decks/url-content-hash", response_model=URLContentHashResponse)
+def get_url_content_hash(body: URLContentHashRequest) -> URLContentHashResponse:
+    from .services.url_service import compute_html_content_hash, fetch_url_content
+
+    try:
+        html = fetch_url_content(body.url)
+    except (URLFetchError, URLValidationError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {exc}") from exc
+
+    return URLContentHashResponse(content_hash=compute_html_content_hash(html))
 
 
 @app.get("/api/v1/decks/history", response_model=DeckHistoryResponse)
@@ -629,3 +654,153 @@ def stream_chat(deck_id: str, body: ChatStreamRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Session endpoints ────────────────────────────────────────────────
+
+
+@app.post("/api/v1/sessions/find-by-content", response_model=FindSessionByContentResponse)
+def find_session_by_content(body: FindSessionByContentRequest) -> FindSessionByContentResponse:
+    session_id = deck_service.find_session_by_content_hashes(set(body.content_hashes))
+    return FindSessionByContentResponse(session_id=session_id)
+
+
+@app.post("/api/v1/sessions/create", response_model=SessionCreateResponse)
+def create_session() -> SessionCreateResponse:
+    session = deck_service.create_session()
+    return SessionCreateResponse(
+        session_id=session.session_id,
+        deck_ids=session.deck_ids,
+        created_at=session.created_at,
+    )
+
+
+@app.post("/api/v1/sessions/{session_id}/add-deck", response_model=SessionAddDeckResponse)
+def add_deck_to_session(session_id: str, body: SessionAddDeckRequest) -> SessionAddDeckResponse:
+    try:
+        session = deck_service.add_deck_to_session(session_id, body.deck_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    except DeckNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Deck not found") from exc
+
+    return SessionAddDeckResponse(
+        session_id=session.session_id,
+        deck_ids=session.deck_ids,
+    )
+
+
+@app.post("/api/v1/sessions/{session_id}/chat/stream")
+def stream_session_chat(session_id: str, body: SessionChatStreamRequest) -> StreamingResponse:
+    try:
+        session = deck_service.get_session(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+
+    _SENTINEL_PREFIX = "[DECK:"
+
+    def event_stream() -> Generator[str, None, None]:
+        yield _sse({"type": "start"})
+
+        for chunk in ai_service.stream_session_answer(
+            session=session,
+            question=body.question,
+            focused_slide_index=body.focused_slide_index,
+            history=[entry.model_dump() for entry in body.history],
+        ):
+            if chunk.startswith("[Error:"):
+                error_message = chunk.removeprefix("[Error:").removesuffix("]").strip()
+                yield _sse({"type": "error", "message": error_message})
+                yield _sse({"type": "done"})
+                return
+            if chunk.startswith(_SENTINEL_PREFIX) and chunk.endswith("]"):
+                active_deck_id = chunk[len(_SENTINEL_PREFIX):-1]
+                yield _sse({"type": "active_deck", "deck_id": active_deck_id})
+                continue
+            yield _sse({"type": "chunk", "text": chunk})
+
+        yield _sse({"type": "done"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/v1/sessions/history", response_model=SessionHistoryResponse)
+def get_session_history() -> SessionHistoryResponse:
+    entries = deck_service.get_session_history()
+    return SessionHistoryResponse(
+        sessions=[SessionHistoryEntry(**e) for e in entries],
+    )
+
+
+@app.post("/api/v1/sessions/{session_id}/reload", response_model=SessionReloadResponse)
+def reload_session(session_id: str) -> SessionReloadResponse:
+    try:
+        session = deck_service.reload_session(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+    except DeckValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    decks_payload = []
+    for did in session.deck_ids:
+        try:
+            record = deck_service.get_deck(did)
+            conversation = deck_service.load_conversation(record.content_hash)
+            decks_payload.append(DeckUploadResponse(
+                deck_id=record.deck_id,
+                filename=record.filename,
+                slide_count=record.slide_count,
+                created_at=record.created_at,
+                narrate_enabled=record.narrate_enabled,
+                content_hash=record.content_hash,
+                content_type=record.content_type,
+                source_url=record.source_url,
+                conversation=conversation,
+            ))
+        except DeckNotFoundError:
+            continue
+
+    session_conversation = deck_service.load_conversation(f"session_{session_id}")
+
+    return SessionReloadResponse(
+        session_id=session.session_id,
+        deck_ids=session.deck_ids,
+        decks=decks_payload,
+        conversation=session_conversation,
+        created_at=session.created_at,
+    )
+
+
+@app.delete("/api/v1/sessions/{session_id}/history", response_model=RemoveHistoryResponse)
+def remove_session_from_history(session_id: str) -> RemoveHistoryResponse:
+    deck_service.remove_session_from_history(session_id)
+    return RemoveHistoryResponse(status="removed")
+
+
+@app.post("/api/v1/sessions/{session_id}/conversation/save", response_model=SaveConversationResponse)
+def save_session_conversation(session_id: str, body: SaveConversationRequest) -> SaveConversationResponse:
+    try:
+        session = deck_service.get_session(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Session not found") from exc
+
+    conversation_data = {
+        "version": 1,
+        "session_id": session.session_id,
+        "deck_ids": session.deck_ids,
+        "branches_by_id": body.branches_by_id,
+        "branch_order": body.branch_order,
+        "active_branch_id": body.active_branch_id,
+        "branch_counter": body.branch_counter,
+        "context_entries": body.context_entries,
+    }
+    deck_service.save_conversation(f"session_{session_id}", conversation_data)
+    return SaveConversationResponse(status="ok")

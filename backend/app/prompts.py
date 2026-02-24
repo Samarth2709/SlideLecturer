@@ -19,6 +19,7 @@ TRANSCRIPT_PROMPT_TEMPLATE = _load_prompt("transcript_prompt.md")
 TRANSCRIPT_SYSTEM_PROMPT = _load_prompt("transcript_system_prompt.md")
 URL_FOCUS_PROMPT_TEMPLATE = _load_prompt("url_focus_prompt.md")
 URL_TRANSCRIPT_PROMPT_TEMPLATE = _load_prompt("url_transcript_prompt.md")
+SESSION_SYSTEM_PROMPT = _load_prompt("session_system_prompt.md")
 
 
 def build_focus_prompt(question: str, slide_number: int) -> str:

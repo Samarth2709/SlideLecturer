@@ -261,6 +261,45 @@ body.is-resizing-split * {
   transform: translate(-50%, -50%);
 }
 
+.deck-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border-bottom: 1px solid var(--accent-strong);
+  background: var(--bg-surface);
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+.deck-tab {
+  flex-shrink: 0;
+  padding: 0.5rem 1rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2.5px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.deck-tab:hover {
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.deck-tab.active {
+  color: var(--accent-strong);
+  border-bottom-color: var(--accent-strong);
+}
+
 .file-tabs {
   display: flex;
   align-items: center;
@@ -2547,4 +2586,59 @@ body.is-resizing-split * {
 .history-item-remove:hover {
   color: var(--danger);
   background: rgba(228, 134, 134, 0.1);
+}
+
+/* ── Notification toast ─────────────────────────────────── */
+
+.notification-toast {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  font-family: 'Space Grotesk', sans-serif;
+  color: var(--text-main);
+  background: var(--bg-elevated);
+  border: 1px solid var(--line);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+  animation: toast-slide-in 0.3s ease-out;
+}
+
+.notification-toast--success {
+  border-color: #4a9e6e;
+}
+
+.notification-toast--info {
+  border-color: var(--line-strong);
+}
+
+.notification-toast-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.notification-toast-close:hover {
+  color: var(--text-main);
+}
+
+@keyframes toast-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
 }

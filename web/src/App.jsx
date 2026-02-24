@@ -1215,6 +1215,10 @@ function App() {
   const [activeFileTabIndex, setActiveFileTabIndex] = useState(null);
   const [selectionReplyCandidate, setSelectionReplyCandidate] = useState(null);
   const [activeReplyContext, setActiveReplyContext] = useState(null);
+  const [session, setSession] = useState(null);
+  const [activeDeckId, setActiveDeckId] = useState(null);
+  const [sessionDecks, setSessionDecks] = useState([]);
+  const [notification, setNotification] = useState(null);
 
   const workspaceRef = useRef(null);
   const slideScrollRef = useRef(null);
@@ -1241,6 +1245,8 @@ function App() {
   const historyDropdownRef = useRef(null);
   const messagesListRef = useRef(null);
   const replyButtonRef = useRef(null);
+  const sessionRef = useRef(session);
+  const sessionDecksRef = useRef(sessionDecks);
 
   const activeBranch = branchesById[activeBranchId] || branchesById[MAIN_BRANCH_ID];
   const messages = activeBranch?.messages || [WELCOME_MESSAGE];
@@ -1506,6 +1512,20 @@ function App() {
     contextEntriesRef.current = contextEntries;
   }, [contextEntries]);
 
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  useEffect(() => {
+    sessionDecksRef.current = sessionDecks;
+  }, [sessionDecks]);
+
+  useEffect(() => {
+    if (!notification) return;
+    const timer = setTimeout(() => setNotification(null), 4000);
+    return () => clearTimeout(timer);
+  }, [notification]);
+
   const resetBranches = useCallback(() => {
     const resetBranchState = {
       [MAIN_BRANCH_ID]: {
@@ -1613,17 +1633,24 @@ function App() {
     );
     if (!hasUserMessages) return;
 
+    const savePayload = {
+      branches_by_id: sanitizedBranches,
+      branch_order: currentBranchOrder,
+      active_branch_id: currentActiveBranchId,
+      branch_counter: branchCounterRef.current,
+      context_entries: contextEntriesRef.current,
+    };
+
     try {
-      await fetch(apiUrl(`/api/v1/decks/${deckId}/conversation/save`), {
+      // Save to session endpoint if session exists, otherwise deck endpoint
+      const currentSession = sessionRef.current;
+      const saveUrl = currentSession
+        ? apiUrl(`/api/v1/sessions/${currentSession.session_id}/conversation/save`)
+        : apiUrl(`/api/v1/decks/${deckId}/conversation/save`);
+      await fetch(saveUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          branches_by_id: sanitizedBranches,
-          branch_order: currentBranchOrder,
-          active_branch_id: currentActiveBranchId,
-          branch_counter: branchCounterRef.current,
-          context_entries: contextEntriesRef.current,
-        }),
+        body: JSON.stringify(savePayload),
       });
     } catch (err) {
       console.warn('Failed to save conversation', err);
@@ -2480,12 +2507,108 @@ function App() {
     }
   }
 
+  async function computeFilesContentHash(files) {
+    if (files.length === 1) {
+      const buffer = await files[0].arrayBuffer();
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+      return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+    // Multi-file: concatenate all file bytes then hash (matches backend logic)
+    const buffers = [];
+    for (const file of files) {
+      buffers.push(await file.arrayBuffer());
+    }
+    const totalLength = buffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+    const combined = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const buf of buffers) {
+      combined.set(new Uint8Array(buf), offset);
+      offset += buf.byteLength;
+    }
+    const hashBuffer = await crypto.subtle.digest('SHA-256', combined);
+    return Array.from(new Uint8Array(hashBuffer)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
+
   async function processUploadFiles(files) {
     setError('');
     setUploading(true);
     resetTranscriptState(0);
 
     try {
+      // Compute content hash client-side to check for duplicates before uploading
+      try {
+        const hashDigest = await computeFilesContentHash(files);
+        const findRes = await fetch(apiUrl('/api/v1/sessions/find-by-content'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content_hashes: [hashDigest] }),
+        });
+        if (findRes.ok) {
+          const findData = await findRes.json();
+          if (findData.session_id) {
+            const reloadRes = await fetch(
+              apiUrl(`/api/v1/sessions/${findData.session_id}/reload`),
+              { method: 'POST' }
+            );
+            if (reloadRes.ok) {
+              const reloadData = await reloadRes.json();
+              const restoredDecks = (reloadData.decks || []).map((d) => ({
+                deck_id: d.deck_id,
+                filename: d.filename,
+                slide_count: d.slide_count,
+              }));
+              setSession({ session_id: reloadData.session_id, deck_ids: reloadData.deck_ids });
+              setSessionDecks(restoredDecks);
+              const firstDeck = reloadData.decks?.[0];
+              if (firstDeck) {
+                setDeck(firstDeck);
+                setActiveDeckId(firstDeck.deck_id);
+                if (typeof firstDeck.narrate_enabled === 'boolean') {
+                  setNarrateEnabled(firstDeck.narrate_enabled);
+                }
+                resetTranscriptState(firstDeck.slide_count || 0);
+                if (firstDeck.content_type === 'url') {
+                  await fetchSections(firstDeck.deck_id);
+                } else {
+                  await fetchSlides(firstDeck.deck_id);
+                }
+              }
+              if (reloadData.conversation) {
+                restoreBranches(reloadData.conversation);
+                const rawEntries = Array.isArray(reloadData.conversation.context_entries)
+                  ? reloadData.conversation.context_entries
+                  : [];
+                const restoredContext = rawEntries
+                  .map((e, i) => {
+                    if (typeof e === 'string') {
+                      return { name: `Entry ${i + 1}`, content: e, type: 'text' };
+                    }
+                    if (e && typeof e === 'object' && e.content) {
+                      return {
+                        name: String(e.name || `Entry ${i + 1}`),
+                        content: String(e.content),
+                        type: e.type === 'file' ? 'file' : 'text',
+                      };
+                    }
+                    return null;
+                  })
+                  .filter(Boolean);
+                setContextEntries(restoredContext);
+              } else {
+                resetBranches();
+                setContextEntries([]);
+              }
+              setInputValue('');
+              setActiveFileTabIndex(null);
+              setNotification({ message: 'Session restored — your previous chat history is available', type: 'success' });
+              return;
+            }
+          }
+        }
+      } catch {
+        // Hash computation or lookup failed — fall through to normal upload
+      }
+
       const form = new FormData();
       for (const file of files) {
         form.append('files', file);
@@ -2503,11 +2626,44 @@ function App() {
       }
 
       const payload = await response.json();
+
       setDeck(payload);
       setActiveFileTabIndex(null);
       if (typeof payload?.narrate_enabled === 'boolean') {
         setNarrateEnabled(payload.narrate_enabled);
       }
+
+      // Create or reuse session, then add deck to it
+      let currentSession = session;
+      if (!currentSession) {
+        const sessionRes = await fetch(apiUrl('/api/v1/sessions/create'), { method: 'POST' });
+        if (sessionRes.ok) {
+          currentSession = await sessionRes.json();
+          setSession(currentSession);
+        }
+      }
+      if (currentSession) {
+        const addRes = await fetch(
+          apiUrl(`/api/v1/sessions/${currentSession.session_id}/add-deck`),
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deck_id: payload.deck_id }),
+          }
+        );
+        if (addRes.ok) {
+          const addData = await addRes.json();
+          currentSession = { ...currentSession, deck_ids: addData.deck_ids };
+          setSession(currentSession);
+        }
+        setSessionDecks((prev) => {
+          const exists = prev.some((d) => d.deck_id === payload.deck_id);
+          if (exists) return prev;
+          return [...prev, { deck_id: payload.deck_id, filename: payload.filename, slide_count: payload.slide_count }];
+        });
+        setActiveDeckId(payload.deck_id);
+      }
+
       if (payload.conversation) {
         restoreBranches(payload.conversation);
         const rawEntries = Array.isArray(payload.conversation.context_entries)
@@ -2535,6 +2691,7 @@ function App() {
       }
       resetTranscriptState(payload.slide_count || 0);
       setInputValue('');
+      setNotification({ message: 'New session created', type: 'info' });
       await fetchSlides(payload.deck_id);
     } catch (uploadError) {
       setError(normalizeError(uploadError, 'Failed to upload deck'));
@@ -2553,6 +2710,88 @@ function App() {
     resetTranscriptState(0);
 
     try {
+      // Compute URL content hash to check for duplicates before ingesting
+      try {
+        const hashRes = await fetch(apiUrl('/api/v1/decks/url-content-hash'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: urlInput.trim() }),
+        });
+        if (hashRes.ok) {
+          const hashData = await hashRes.json();
+          if (hashData.content_hash) {
+            const findRes = await fetch(apiUrl('/api/v1/sessions/find-by-content'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ content_hashes: [hashData.content_hash] }),
+            });
+            if (findRes.ok) {
+              const findData = await findRes.json();
+              if (findData.session_id) {
+                const reloadRes = await fetch(
+                  apiUrl(`/api/v1/sessions/${findData.session_id}/reload`),
+                  { method: 'POST' }
+                );
+                if (reloadRes.ok) {
+                  const reloadData = await reloadRes.json();
+                  const restoredDecks = (reloadData.decks || []).map((d) => ({
+                    deck_id: d.deck_id,
+                    filename: d.filename,
+                    slide_count: d.slide_count,
+                  }));
+                  setSession({ session_id: reloadData.session_id, deck_ids: reloadData.deck_ids });
+                  setSessionDecks(restoredDecks);
+                  const firstDeck = reloadData.decks?.[0];
+                  if (firstDeck) {
+                    setDeck(firstDeck);
+                    setActiveDeckId(firstDeck.deck_id);
+                    if (typeof firstDeck.narrate_enabled === 'boolean') {
+                      setNarrateEnabled(firstDeck.narrate_enabled);
+                    }
+                    resetTranscriptState(firstDeck.slide_count || 0);
+                    if (firstDeck.content_type === 'url') {
+                      await fetchSections(firstDeck.deck_id);
+                    } else {
+                      await fetchSlides(firstDeck.deck_id);
+                    }
+                  }
+                  if (reloadData.conversation) {
+                    restoreBranches(reloadData.conversation);
+                    const rawEntries = Array.isArray(reloadData.conversation.context_entries)
+                      ? reloadData.conversation.context_entries
+                      : [];
+                    const restoredContext = rawEntries
+                      .map((e, i) => {
+                        if (typeof e === 'string') {
+                          return { name: `Entry ${i + 1}`, content: e, type: 'text' };
+                        }
+                        if (e && typeof e === 'object' && e.content) {
+                          return {
+                            name: String(e.name || `Entry ${i + 1}`),
+                            content: String(e.content),
+                            type: e.type === 'file' ? 'file' : 'text',
+                          };
+                        }
+                        return null;
+                      })
+                      .filter(Boolean);
+                    setContextEntries(restoredContext);
+                  } else {
+                    resetBranches();
+                    setContextEntries([]);
+                  }
+                  setInputValue('');
+                  setNotification({ message: 'Session restored — your previous chat history is available', type: 'success' });
+                  return;
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // Hash lookup failed — fall through to normal ingest
+      }
+
       const response = await fetch(apiUrl('/api/v1/decks/ingest-url'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2568,10 +2807,43 @@ function App() {
       }
 
       const payload = await response.json();
+
       setDeck(payload);
       if (typeof payload?.narrate_enabled === 'boolean') {
         setNarrateEnabled(payload.narrate_enabled);
       }
+
+      // Create or reuse session, then add deck to it
+      let currentSession = sessionRef.current;
+      if (!currentSession) {
+        const sessionRes = await fetch(apiUrl('/api/v1/sessions/create'), { method: 'POST' });
+        if (sessionRes.ok) {
+          currentSession = await sessionRes.json();
+          setSession(currentSession);
+        }
+      }
+      if (currentSession) {
+        const addRes = await fetch(
+          apiUrl(`/api/v1/sessions/${currentSession.session_id}/add-deck`),
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deck_id: payload.deck_id }),
+          }
+        );
+        if (addRes.ok) {
+          const addData = await addRes.json();
+          currentSession = { ...currentSession, deck_ids: addData.deck_ids };
+          setSession(currentSession);
+        }
+        setSessionDecks((prev) => {
+          const exists = prev.some((d) => d.deck_id === payload.deck_id);
+          if (exists) return prev;
+          return [...prev, { deck_id: payload.deck_id, filename: payload.filename, slide_count: payload.slide_count }];
+        });
+        setActiveDeckId(payload.deck_id);
+      }
+
       if (payload.conversation) {
         restoreBranches(payload.conversation);
         const rawEntries = Array.isArray(payload.conversation.context_entries)
@@ -2599,6 +2871,7 @@ function App() {
       }
       resetTranscriptState(payload.slide_count || 0);
       setInputValue('');
+      setNotification({ message: 'New session created', type: 'info' });
       await fetchSections(payload.deck_id);
     } catch (urlError) {
       setError(normalizeError(urlError, 'Failed to load URL'));
@@ -2613,10 +2886,29 @@ function App() {
 
   async function fetchHistory() {
     try {
-      const response = await fetch(apiUrl('/api/v1/decks/history'));
-      if (!response.ok) return;
-      const data = await response.json();
-      setHistoryEntries(data.decks || []);
+      const [decksRes, sessionsRes] = await Promise.all([
+        fetch(apiUrl('/api/v1/decks/history')),
+        fetch(apiUrl('/api/v1/sessions/history')),
+      ]);
+      const decksData = decksRes.ok ? await decksRes.json() : { decks: [] };
+      const sessionsData = sessionsRes.ok ? await sessionsRes.json() : { sessions: [] };
+
+      // Combine: sessions first (marked with _type), then standalone decks
+      const sessionDeckIds = new Set();
+      const sessionEntries = (sessionsData.sessions || []).map((s) => {
+        (s.deck_ids || []).forEach((id) => sessionDeckIds.add(id));
+        return {
+          ...s,
+          _type: 'session',
+          filename: (s.filenames || []).join(', ') || `Session (${(s.deck_ids || []).length} decks)`,
+          slide_count: s.total_slides || 0,
+        };
+      });
+      const deckEntries = (decksData.decks || [])
+        .filter((d) => !sessionDeckIds.has(d.deck_id))
+        .map((d) => ({ ...d, _type: 'deck' }));
+
+      setHistoryEntries([...sessionEntries, ...deckEntries]);
     } catch {
       // Silently fail - history is non-critical
     }
@@ -2638,6 +2930,65 @@ function App() {
     resetTranscriptState(0);
 
     try {
+      if (entry._type === 'session') {
+        // Reload a session with all its decks
+        const response = await fetch(
+          apiUrl(`/api/v1/sessions/${entry.session_id}/reload`),
+          { method: 'POST' }
+        );
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(extractApiErrorMessage(data, 'Failed to reload session'));
+        }
+        const payload = await response.json();
+        const restoredDecks = (payload.decks || []).map((d) => ({
+          deck_id: d.deck_id,
+          filename: d.filename,
+          slide_count: d.slide_count,
+        }));
+        setSession({ session_id: payload.session_id, deck_ids: payload.deck_ids });
+        setSessionDecks(restoredDecks);
+        // Set the first deck as active
+        const firstDeck = payload.decks?.[0];
+        if (firstDeck) {
+          setDeck(firstDeck);
+          setActiveDeckId(firstDeck.deck_id);
+          if (typeof firstDeck.narrate_enabled === 'boolean') {
+            setNarrateEnabled(firstDeck.narrate_enabled);
+          }
+          resetTranscriptState(firstDeck.slide_count || 0);
+          await fetchSlides(firstDeck.deck_id);
+        }
+        if (payload.conversation) {
+          restoreBranches(payload.conversation);
+          const rawEntries = Array.isArray(payload.conversation.context_entries)
+            ? payload.conversation.context_entries
+            : [];
+          const restoredContext = rawEntries
+            .map((e, i) => {
+              if (typeof e === 'string') {
+                return { name: `Entry ${i + 1}`, content: e, type: 'text' };
+              }
+              if (e && typeof e === 'object' && e.content) {
+                return {
+                  name: String(e.name || `Entry ${i + 1}`),
+                  content: String(e.content),
+                  type: e.type === 'file' ? 'file' : 'text',
+                };
+              }
+              return null;
+            })
+            .filter(Boolean);
+          setContextEntries(restoredContext);
+        } else {
+          resetBranches();
+          setContextEntries([]);
+        }
+        setInputValue('');
+        return;
+      }
+
+      // Original deck reload flow
       const response = await fetch(
         apiUrl(`/api/v1/decks/${entry.deck_id}/reload?narrate_enabled=${narrateEnabled}`),
         { method: 'POST' }
@@ -2650,6 +3001,9 @@ function App() {
 
       const payload = await response.json();
       setDeck(payload);
+      setSession(null);
+      setSessionDecks([]);
+      setActiveDeckId(null);
       if (typeof payload?.narrate_enabled === 'boolean') {
         setNarrateEnabled(payload.narrate_enabled);
       }
@@ -2687,9 +3041,12 @@ function App() {
         await fetchSlides(payload.deck_id);
       }
     } catch (loadError) {
-      setError(normalizeError(loadError, 'Failed to load deck from history'));
+      setError(normalizeError(loadError, 'Failed to load from history'));
       setDeck(null);
       setSlides([]);
+      setSession(null);
+      setSessionDecks([]);
+      setActiveDeckId(null);
       resetBranches();
       resetTranscriptState(0);
     } finally {
@@ -2697,17 +3054,32 @@ function App() {
     }
   }
 
-  async function removeFromHistory(e, deckId) {
+  async function removeFromHistory(e, entry) {
     e.stopPropagation();
     try {
-      const response = await fetch(apiUrl(`/api/v1/decks/${deckId}/history`), { method: 'DELETE' });
-      if (!response.ok) return;
-      setHistoryEntries((prev) => prev.filter((entry) => entry.deck_id !== deckId));
-      if (deck?.deck_id === deckId) {
-        setDeck(null);
-        setSlides([]);
-        resetBranches();
-        resetTranscriptState(0);
+      if (entry._type === 'session') {
+        const response = await fetch(apiUrl(`/api/v1/sessions/${entry.session_id}/history`), { method: 'DELETE' });
+        if (!response.ok) return;
+        setHistoryEntries((prev) => prev.filter((h) => h.session_id !== entry.session_id));
+        if (session?.session_id === entry.session_id) {
+          setDeck(null);
+          setSlides([]);
+          setSession(null);
+          setSessionDecks([]);
+          setActiveDeckId(null);
+          resetBranches();
+          resetTranscriptState(0);
+        }
+      } else {
+        const response = await fetch(apiUrl(`/api/v1/decks/${entry.deck_id}/history`), { method: 'DELETE' });
+        if (!response.ok) return;
+        setHistoryEntries((prev) => prev.filter((h) => h.deck_id !== entry.deck_id));
+        if (deck?.deck_id === entry.deck_id) {
+          setDeck(null);
+          setSlides([]);
+          resetBranches();
+          resetTranscriptState(0);
+        }
       }
     } catch {
       // Silently fail
@@ -3648,22 +4020,33 @@ function App() {
     setStreamingBranchId(branchId);
 
     try {
-      const response = await fetch(apiUrl(`/api/v1/decks/${deck.deck_id}/chat/stream`), {
+      const currentSession = sessionRef.current;
+      const chatEndpoint = currentSession
+        ? apiUrl(`/api/v1/sessions/${currentSession.session_id}/chat/stream`)
+        : apiUrl(`/api/v1/decks/${deck.deck_id}/chat/stream`);
+      const chatBody = currentSession
+        ? {
+            question: normalizedQuestion,
+            history: branchHistory,
+            focused_slide_index: normalizedRequestContext.focusedSlideIndex,
+          }
+        : {
+            question: normalizedQuestion,
+            history: branchHistory,
+            current_slide_index: normalizedRequestContext.currentSlideIndex,
+            focused_slide_index: normalizedRequestContext.focusedSlideIndex,
+            additional_content: contextSnapshot.map((entry) => ({
+              name: entry.name,
+              content: entry.content,
+              type: entry.type,
+            })),
+          };
+      const response = await fetch(chatEndpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          question: normalizedQuestion,
-          history: branchHistory,
-          current_slide_index: normalizedRequestContext.currentSlideIndex,
-          focused_slide_index: normalizedRequestContext.focusedSlideIndex,
-          additional_content: contextSnapshot.map((entry) => ({
-            name: entry.name,
-            content: entry.content,
-            type: entry.type,
-          })),
-        }),
+        body: JSON.stringify(chatBody),
       });
 
       if (!response.ok) {
@@ -3672,6 +4055,32 @@ function App() {
       }
 
       await consumeSse(response, (payload) => {
+        if (payload.type === 'active_deck' && payload.deck_id) {
+          setActiveDeckId(payload.deck_id);
+          // Find deck info from sessionDecksRef (avoid stale closure)
+          const deckInfo = sessionDecksRef.current.find((d) => d.deck_id === payload.deck_id);
+          if (deckInfo) {
+            // Fetch slides for the newly active deck
+            fetch(apiUrl(`/api/v1/decks/${payload.deck_id}/slides`))
+              .then((r) => r.json())
+              .then((data) => {
+                setSlides(data.slides || []);
+                setCurrentSlideIndex(0);
+                setFocusedSlideIndex(null);
+                // Update the main deck object for slide rendering
+                setDeck((prev) => prev ? {
+                  ...prev,
+                  deck_id: payload.deck_id,
+                  filename: deckInfo.filename,
+                  slide_count: deckInfo.slide_count,
+                  content_type: 'pdf',
+                } : prev);
+              })
+              .catch(() => {});
+          }
+          return;
+        }
+
         if (payload.type === 'chunk' && typeof payload.text === 'string') {
           updateBranchMessages(branchId, (previous) =>
             previous.map((message) =>
@@ -4110,6 +4519,12 @@ function App() {
 
   return (
     <div className="app-shell">
+      {notification && (
+        <div className={`notification-toast notification-toast--${notification.type}`}>
+          <span>{notification.message}</span>
+          <button className="notification-toast-close" onClick={() => setNotification(null)}>&times;</button>
+        </div>
+      )}
       <header className="topbar">
         <h1>Slide Study Studio</h1>
         {deck ? (
@@ -4139,31 +4554,40 @@ function App() {
                   <p className="history-empty">No recent lectures</p>
                 ) : (
                   <ul className="history-list">
-                    {historyEntries.map((entry) => (
-                      <li
-                        key={entry.deck_id}
-                        className={`history-item ${deck?.deck_id === entry.deck_id ? 'active' : ''}`}
-                        onClick={() => loadFromHistory(entry)}
-                      >
-                        <div className="history-item-info">
-                          <span className="history-item-name" title={entry.source_url || entry.filename}>
-                            {entry.filename}
-                          </span>
-                          <span className="history-item-meta">
-                            {entry.slide_count} {entry.content_type === 'url' ? 'sections' : 'slides'}
-                            {entry.last_accessed_at ? ` \u00b7 ${new Date(entry.last_accessed_at).toLocaleDateString()}` : ''}
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          className="history-item-remove"
-                          onClick={(e) => removeFromHistory(e, entry.deck_id)}
-                          title="Remove from history"
+                    {historyEntries.map((entry) => {
+                      const key = entry._type === 'session' ? `session-${entry.session_id}` : entry.deck_id;
+                      const isActive = entry._type === 'session'
+                        ? session?.session_id === entry.session_id
+                        : deck?.deck_id === entry.deck_id;
+                      const label = entry._type === 'session' && (entry.deck_ids?.length || 0) > 1
+                        ? `${entry.filename} (${entry.deck_ids.length} decks)`
+                        : entry.filename;
+                      return (
+                        <li
+                          key={key}
+                          className={`history-item ${isActive ? 'active' : ''}`}
+                          onClick={() => loadFromHistory(entry)}
                         >
-                          {"\u00d7"}
-                        </button>
-                      </li>
-                    ))}
+                          <div className="history-item-info">
+                            <span className="history-item-name" title={entry.source_url || label}>
+                              {label}
+                            </span>
+                            <span className="history-item-meta">
+                              {entry.slide_count} {entry.content_type === 'url' ? 'sections' : 'slides'}
+                              {entry.last_accessed_at ? ` \u00b7 ${new Date(entry.last_accessed_at).toLocaleDateString()}` : ''}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            className="history-item-remove"
+                            onClick={(e) => removeFromHistory(e, entry)}
+                            title="Remove from history"
+                          >
+                            {"\u00d7"}
+                          </button>
+                        </li>
+                      );
+                    })}
                   </ul>
                 )}
               </div>
@@ -4187,6 +4611,37 @@ function App() {
         {slidesVisible ? (
           <>
             <section className="slides-panel" style={slidesPaneStyle}>
+              {sessionDecks.length > 1 ? (
+                <div className="deck-tabs">
+                  {sessionDecks.map((d) => (
+                    <button
+                      key={d.deck_id}
+                      type="button"
+                      className={`deck-tab ${activeDeckId === d.deck_id ? 'active' : ''}`}
+                      onClick={() => {
+                        setActiveDeckId(d.deck_id);
+                        fetch(apiUrl(`/api/v1/decks/${d.deck_id}/slides`))
+                          .then((r) => r.json())
+                          .then((data) => {
+                            setSlides(data.slides || []);
+                            setCurrentSlideIndex(0);
+                            setFocusedSlideIndex(null);
+                            setDeck((prev) => prev ? {
+                              ...prev,
+                              deck_id: d.deck_id,
+                              filename: d.filename,
+                              slide_count: d.slide_count,
+                              content_type: 'pdf',
+                            } : prev);
+                          })
+                          .catch(() => {});
+                      }}
+                    >
+                      {d.filename.replace(/\.[^/.]+$/, '')}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               {deck?.source_files?.length > 1 ? (
                 <div className="file-tabs">
                   <button

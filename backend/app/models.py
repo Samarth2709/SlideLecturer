@@ -107,6 +107,14 @@ class URLIngestRequest(BaseModel):
     narrate_enabled: bool = True
 
 
+class URLContentHashRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+
+
+class URLContentHashResponse(BaseModel):
+    content_hash: str
+
+
 class SectionSummary(BaseModel):
     index: int
     heading: str
@@ -137,6 +145,56 @@ class DeckHistoryResponse(BaseModel):
 
 class RemoveHistoryResponse(BaseModel):
     status: Literal["removed"]
+
+
+class SessionCreateResponse(BaseModel):
+    session_id: str
+    deck_ids: list[str]
+    created_at: datetime
+
+
+class SessionAddDeckRequest(BaseModel):
+    deck_id: str
+
+
+class SessionAddDeckResponse(BaseModel):
+    session_id: str
+    deck_ids: list[str]
+
+
+class SessionChatStreamRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=6000)
+    history: list[ChatHistoryTurn] = Field(default_factory=list, max_length=40)
+    focused_slide_index: int | None = Field(default=None, ge=0)
+
+
+class SessionHistoryEntry(BaseModel):
+    session_id: str
+    deck_ids: list[str]
+    filenames: list[str] = []
+    total_slides: int = 0
+    created_at: str
+    last_accessed_at: str
+
+
+class SessionHistoryResponse(BaseModel):
+    sessions: list[SessionHistoryEntry]
+
+
+class SessionReloadResponse(BaseModel):
+    session_id: str
+    deck_ids: list[str]
+    decks: list[DeckUploadResponse]
+    conversation: dict | None = None
+    created_at: datetime
+
+
+class FindSessionByContentRequest(BaseModel):
+    content_hashes: list[str]
+
+
+class FindSessionByContentResponse(BaseModel):
+    session_id: str | None = None
 
 
 class ErrorResponse(BaseModel):

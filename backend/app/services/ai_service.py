@@ -19,6 +19,7 @@ except ImportError:
 
 from ..config import settings
 from ..prompts import (
+    SESSION_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     TRANSCRIPT_SYSTEM_PROMPT,
     build_focus_prompt,
@@ -27,8 +28,9 @@ from ..prompts import (
     build_url_transcript_prompt,
 )
 from .content_tools import ContentToolResolver, get_tools
+from .deck_tools import DeckToolResolver, SESSION_DECK_TOOLS
 from .url_service import extract_images_from_html, fetch_image_as_base64
-from .deck_service import DeckNotFoundError, DeckRecord, DeckService
+from .deck_service import DeckNotFoundError, DeckRecord, DeckService, SessionRecord
 
 _MAX_TOOL_ROUNDS = 5
 _TOOL_INDICATOR_RE = re.compile(
@@ -98,6 +100,154 @@ class AIService:
                 history=history,
                 additional_content=additional_content,
             )
+
+    def stream_session_answer(
+        self,
+        session: SessionRecord,
+        question: str,
+        focused_slide_index: int | None = None,
+        history: list[dict[str, str]] | None = None,
+    ) -> Generator[str, None, None]:
+        """Stream an answer for a multi-deck session using RLM-style tool use."""
+        if not self.is_available:
+            yield "[Error: AI service not available. Set ANTHROPIC_API_KEY.]"
+            return
+        yield from self._stream_session_answer_direct(
+            session=session,
+            question=question,
+            focused_slide_index=focused_slide_index,
+            history=history,
+        )
+
+    def _stream_session_answer_direct(
+        self,
+        session: SessionRecord,
+        question: str,
+        focused_slide_index: int | None = None,
+        history: list[dict[str, str]] | None = None,
+    ) -> Generator[str, None, None]:
+        """Agentic loop: AI navigates decks via tools, streaming text back."""
+        if history is not None:
+            normalized_history = [
+                {"role": entry["role"], "content": entry["content"]}
+                for entry in history[-20:]
+                if entry.get("role") in {"user", "assistant"} and entry.get("content")
+            ]
+        else:
+            with session.lock:
+                normalized_history = list(session.conversation_history[-20:])
+
+        messages = self._build_history_messages(normalized_history)
+
+        prompt_text = question
+        if focused_slide_index is not None:
+            prompt_text = f"[Focus: slide index {focused_slide_index}] {question}"
+
+        messages = messages + [{"role": "user", "content": [self._build_text_block(prompt_text)]}]
+
+        resolver = DeckToolResolver(session, self.deck_service)
+        previous_deck_id: str | None = None
+        full_response = ""
+        clean_response = ""
+
+        _SENTINEL_PREFIX = "[DECK:"
+
+        try:
+            for _round_num in range(_MAX_TOOL_ROUNDS + 1):
+                tool_use_blocks: list[dict] = []
+
+                with self.client.messages.stream(
+                    model=settings.model_name,
+                    max_tokens=2048,
+                    system=SESSION_SYSTEM_PROMPT,
+                    messages=messages,
+                    tools=SESSION_DECK_TOOLS,
+                ) as stream:
+                    current_block_type: str | None = None
+                    current_tool_use: dict | None = None
+
+                    for event in stream:
+                        if event.type == "content_block_start":
+                            block = event.content_block
+                            if block.type == "text":
+                                current_block_type = "text"
+                            elif block.type == "tool_use":
+                                current_block_type = "tool_use"
+                                current_tool_use = {
+                                    "id": block.id,
+                                    "name": block.name,
+                                    "input_json": "",
+                                }
+
+                        elif event.type == "content_block_delta":
+                            if current_block_type == "text" and hasattr(event.delta, "text"):
+                                full_response += event.delta.text
+                                clean_response += event.delta.text
+                                yield event.delta.text
+                            elif current_block_type == "tool_use" and hasattr(event.delta, "partial_json"):
+                                current_tool_use["input_json"] += event.delta.partial_json
+
+                        elif event.type == "content_block_stop":
+                            if current_block_type == "tool_use" and current_tool_use:
+                                tool_use_blocks.append(current_tool_use)
+                            current_block_type = None
+                            current_tool_use = None
+
+                    final_message = stream.get_final_message()
+
+                if not tool_use_blocks or final_message.stop_reason != "tool_use":
+                    break
+
+                # Build assistant content from final message
+                assistant_content: list[dict] = []
+                for block in final_message.content:
+                    if block.type == "text":
+                        assistant_content.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        })
+                messages.append({"role": "assistant", "content": assistant_content})
+
+                # Execute tools
+                tool_results: list[dict] = []
+                for tool_block in tool_use_blocks:
+                    try:
+                        input_data = json.loads(tool_block["input_json"]) if tool_block["input_json"] else {}
+                    except json.JSONDecodeError:
+                        input_data = {}
+                    label = resolver.tool_call_label(tool_block["name"], input_data)
+                    indicator = f"\n\n> *{label}*\n\n"
+                    full_response += indicator
+                    yield indicator
+                    result = resolver.execute(tool_block["name"], input_data)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_block["id"],
+                        "content": result,
+                    })
+
+                    # Emit active_deck sentinel if resolver changed decks
+                    if resolver.last_fetched_deck_id and resolver.last_fetched_deck_id != previous_deck_id:
+                        previous_deck_id = resolver.last_fetched_deck_id
+                        sentinel = f"{_SENTINEL_PREFIX}{resolver.last_fetched_deck_id}]"
+                        yield sentinel
+
+                messages.append({"role": "user", "content": tool_results})
+
+        except Exception as exc:  # noqa: BLE001
+            yield f"[Error: {exc}]"
+            return
+
+        # Update conversation history
+        if history is None:
+            with session.lock:
+                session.conversation_history.append({"role": "user", "content": prompt_text})
+                session.conversation_history.append({"role": "assistant", "content": clean_response})
+                session.is_first_message = False
 
     def _stream_answer_rlm(
         self,

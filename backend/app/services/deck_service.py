@@ -29,6 +29,10 @@ class DeckNotFoundError(KeyError):
     """Raised when a deck ID does not exist."""
 
 
+class SessionNotFoundError(KeyError):
+    """Raised when a session ID does not exist."""
+
+
 @dataclass
 class DeckRecord:
     """In-memory metadata and runtime state for a deck."""
@@ -68,6 +72,18 @@ class DeckRecord:
             return self._pdf_base64
 
 
+@dataclass
+class SessionRecord:
+    """In-memory metadata and runtime state for a multi-deck session."""
+
+    session_id: str
+    deck_ids: list[str] = field(default_factory=list)
+    conversation_history: list[dict] = field(default_factory=list)
+    is_first_message: bool = True
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+
 class DeckService:
     """Service that manages deck lifecycle and slide extraction."""
 
@@ -80,6 +96,8 @@ class DeckService:
         self.conversations_dir.mkdir(parents=True, exist_ok=True)
         self._manifest_path = self.storage_dir / "deck_manifest.json"
         self._decks: dict[str, DeckRecord] = {}
+        self._sessions: dict[str, SessionRecord] = {}
+        self._session_manifest_path = self.storage_dir / "session_manifest.json"
         self._lock = threading.RLock()
 
     def create_deck(self, filename: str, content_stream: BinaryIO, narrate_enabled: bool = True) -> DeckRecord:
@@ -556,6 +574,193 @@ class DeckService:
             content_hash = deck.content_hash
         if content_hash:
             self.delete_conversation(content_hash)
+
+    # ── Session methods ──────────────────────────────────────────────
+
+    def create_session(self) -> SessionRecord:
+        session_id = uuid4().hex
+        session = SessionRecord(session_id=session_id)
+        with self._lock:
+            self._sessions[session_id] = session
+        self._add_session_to_manifest(session)
+        return session
+
+    def get_session(self, session_id: str) -> SessionRecord:
+        with self._lock:
+            session = self._sessions.get(session_id)
+        if session is not None:
+            return session
+        # Try reloading from manifest
+        try:
+            return self.reload_session(session_id)
+        except (SessionNotFoundError, DeckNotFoundError, DeckValidationError) as exc:
+            raise SessionNotFoundError(session_id) from exc
+
+    def add_deck_to_session(self, session_id: str, deck_id: str) -> SessionRecord:
+        session = self.get_session(session_id)
+        # Validate deck exists
+        self.get_deck(deck_id)
+        with session.lock:
+            if deck_id not in session.deck_ids:
+                session.deck_ids.append(deck_id)
+        self._add_session_to_manifest(session)
+        return session
+
+    def clear_session_chat(self, session_id: str) -> None:
+        session = self.get_session(session_id)
+        with session.lock:
+            session.conversation_history.clear()
+            session.is_first_message = True
+        self.delete_conversation(f"session_{session_id}")
+
+    # ── Session persistence ──────────────────────────────────────────
+
+    def _load_session_manifest(self) -> list[dict]:
+        try:
+            data = json.loads(self._session_manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return data
+
+    def _save_session_manifest(self, entries: list[dict]) -> None:
+        temp = self._session_manifest_path.with_name(
+            f".{self._session_manifest_path.name}.{uuid4().hex}.tmp"
+        )
+        try:
+            temp.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+            temp.replace(self._session_manifest_path)
+        except OSError:
+            try:
+                if temp.exists():
+                    temp.unlink()
+            except OSError:
+                pass
+
+    def _add_session_to_manifest(self, session: SessionRecord) -> None:
+        with self._lock:
+            entries = self._load_session_manifest()
+            entries = [e for e in entries if e.get("session_id") != session.session_id]
+            entries.insert(0, {
+                "session_id": session.session_id,
+                "deck_ids": list(session.deck_ids),
+                "created_at": session.created_at.isoformat(),
+                "last_accessed_at": datetime.now(timezone.utc).isoformat(),
+            })
+            self._save_session_manifest(entries)
+
+    def get_session_history(self) -> list[dict]:
+        with self._lock:
+            entries = self._load_session_manifest()
+            deck_manifest = self._load_manifest()
+        # Build a lookup dict for O(1) access by deck_id
+        deck_lookup: dict[str, dict] = {
+            me.get("deck_id", ""): me for me in deck_manifest if me.get("deck_id")
+        }
+        valid = []
+        for entry in entries:
+            deck_ids = entry.get("deck_ids", [])
+            if not deck_ids:
+                continue
+            all_exist = all(
+                (self.storage_dir / did).exists() for did in deck_ids
+            )
+            if all_exist:
+                filenames = []
+                total_slides = 0
+                for did in deck_ids:
+                    me = deck_lookup.get(did)
+                    if me:
+                        filenames.append(me.get("filename", did))
+                        total_slides += me.get("slide_count", 0)
+                    else:
+                        filenames.append(did)
+                entry["filenames"] = filenames
+                entry["total_slides"] = total_slides
+                valid.append(entry)
+        return valid
+
+    def reload_session(self, session_id: str) -> SessionRecord:
+        with self._lock:
+            existing = self._sessions.get(session_id)
+            if existing is not None:
+                return existing
+
+        entries = self._load_session_manifest()
+        entry = None
+        for e in entries:
+            if e.get("session_id") == session_id:
+                entry = e
+                break
+        if entry is None:
+            raise SessionNotFoundError(session_id)
+
+        deck_ids = entry.get("deck_ids", [])
+        # Reload each deck
+        for did in deck_ids:
+            self.reload_deck(did, narrate_enabled=True)
+
+        created_at_str = entry.get("created_at", "")
+        try:
+            created_at = datetime.fromisoformat(created_at_str)
+        except (ValueError, TypeError):
+            created_at = datetime.now(timezone.utc)
+
+        session = SessionRecord(
+            session_id=session_id,
+            deck_ids=list(deck_ids),
+            created_at=created_at,
+        )
+
+        # Load session conversation history
+        conv = self.load_conversation(f"session_{session_id}")
+        if conv and isinstance(conv.get("conversation_history"), list):
+            session.conversation_history = conv["conversation_history"]
+            session.is_first_message = False
+
+        with self._lock:
+            self._sessions[session_id] = session
+
+        # Touch manifest
+        with self._lock:
+            all_entries = self._load_session_manifest()
+            for e in all_entries:
+                if e.get("session_id") == session_id:
+                    e["last_accessed_at"] = datetime.now(timezone.utc).isoformat()
+                    break
+            self._save_session_manifest(all_entries)
+
+        return session
+
+    def remove_session_from_history(self, session_id: str) -> None:
+        with self._lock:
+            entries = self._load_session_manifest()
+            entries = [e for e in entries if e.get("session_id") != session_id]
+            self._save_session_manifest(entries)
+            self._sessions.pop(session_id, None)
+        self.delete_conversation(f"session_{session_id}")
+
+    def find_session_by_content_hashes(self, content_hashes: set[str]) -> str | None:
+        """Find an existing session whose decks match the given content hashes exactly."""
+        if not content_hashes:
+            return None
+        with self._lock:
+            entries = self._load_session_manifest()
+            deck_manifest = self._load_manifest()
+        hash_by_deck_id = {
+            e.get("deck_id", ""): e.get("content_hash", "")
+            for e in deck_manifest if e.get("deck_id")
+        }
+        for entry in entries:
+            deck_ids = entry.get("deck_ids", [])
+            session_hashes = {hash_by_deck_id.get(did, "") for did in deck_ids}
+            session_hashes.discard("")
+            if session_hashes == content_hashes:
+                return entry.get("session_id")
+        return None
+
+    # ── End session methods ──────────────────────────────────────────
 
     def _compute_content_hash(self, file_path: Path) -> str:
         return hashlib.sha256(file_path.read_bytes()).hexdigest()
